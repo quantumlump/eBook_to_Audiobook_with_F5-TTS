@@ -1,0 +1,12 @@
+
+
+
+
+
+docker build -t f5tts .
+
+
+docker run -it -p 7860:7860 --gpus all f5tts
+
+
+http://localhost:7860
