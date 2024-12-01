@@ -140,18 +140,20 @@ def embed_cover_into_mp3(mp3_path, cover_image_path):
     except error:
         audio = ID3()
 
+    # Remove existing APIC frames to avoid duplicates
     audio.delall("APIC")
 
     try:
         with open(cover_image_path, 'rb') as img:
             audio.add(APIC(
-                encoding=3,
-                mime='image/jpeg',
-                type=1,
-                desc='Icon',
+                encoding=3,          # 3 is for UTF-8
+                mime='image/jpeg',   # Image MIME type
+                type=3,              # 3 is for front cover
+                desc='Front cover',  # Description
                 data=img.read()
             ))
-        audio.save(mp3_path)
+        # Save with ID3v2.3 for better compatibility
+        audio.save(mp3_path, v2_version=3)
         print(f"Embedded cover image into {mp3_path}")
     except Exception as e:
         print(f"Failed to embed cover image into MP3: {e}")
@@ -456,7 +458,7 @@ def create_gradio_app():
         )
 
         generate_btn = gr.Button("Start", variant="primary")
-        audio_output = gr.Files(label="Inference Progress (After 100%, Audio Chunks are Stiched)")
+        audio_output = gr.Files(label="Inference Progress (After 100%, Audio Chunks are Stitched)")
 
         show_audiobooks_btn = gr.Button("Show All Completed Audiobooks", variant="secondary")
         audiobooks_output = gr.Files(label="Converted Audiobooks (Download Links ->)")
@@ -521,7 +523,7 @@ def main(port, host, share, api):
     app.queue().launch(
         server_name="0.0.0.0",
         server_port=port or 7860,
-        share=True,
+        share=share,
         show_api=api,
         debug=True
     )
