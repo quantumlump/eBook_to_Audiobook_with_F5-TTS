@@ -249,7 +249,7 @@ def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.15, speed=1,
 def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_duration, speed, progress=gr.Progress()):
     """Main function to convert eBooks to audiobooks."""
     try:
-        generated_files = []
+        last_file = None
 
         num_ebooks = len(gen_file_input)
         for idx, ebook in enumerate(gen_file_input):
@@ -302,13 +302,12 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
             if cover_image and os.path.exists(cover_image):
                 os.remove(cover_image)
 
-            generated_files.append(tmp_mp3_path)
+            last_file = tmp_mp3_path
             progress(1, desc="Completed processing ebook")
 
         audiobooks = show_converted_audiobooks()
-        last_file = generated_files[-1] if generated_files else None
 
-        return generated_files, last_file, audiobooks
+        return last_file, audiobooks
 
     except Exception as e:
         print(f"An error occurred: {e}")
@@ -332,7 +331,6 @@ def create_gradio_app():
         )
 
         generate_btn = gr.Button("Start", variant="primary")
-        audio_output = gr.Files(label="Progress")
 
         show_audiobooks_btn = gr.Button("Show All Completed Audiobooks", variant="secondary")
         audiobooks_output = gr.Files(label="Converted Audiobooks (Download Links ->)")
@@ -368,7 +366,7 @@ def create_gradio_app():
                 cross_fade_duration_slider,
                 speed_slider,
             ],
-            outputs=[audio_output, player, audiobooks_output],
+            outputs=[player, audiobooks_output],
             show_progress=True,  # Enable progress bar
         )
 
@@ -411,5 +409,3 @@ if __name__ == "__main__":
     else:
         app = create_gradio_app()
         app.queue().launch(debug=True)
-
-
