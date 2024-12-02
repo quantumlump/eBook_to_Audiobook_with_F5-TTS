@@ -32,6 +32,13 @@ from f5_tts.infer.utils_infer import (
 
 import torch  # Added missing import
 
+# Determine the available device (GPU or CPU)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    print("CUDA is available. Using GPU.")
+else:
+    print("CUDA is not available. Using CPU.")
+
 try:
     import spaces
     USING_SPACES = True
@@ -62,7 +69,8 @@ def load_f5tts(ckpt_path=None):
     }
     model = load_model(DiT, model_cfg, ckpt_path)
     model.eval()  # Ensure the model is in evaluation mode
-    model.to('cuda')  # Move model to GPU
+    model = model.to(device)  # Move model to the selected device
+    print(f"Model loaded on {device}.")
     return model
 
 F5TTS_ema_model = load_f5tts()
@@ -80,7 +88,7 @@ def generate_response(messages, model, tokenizer):
     )
 
     # Tokenizer and model input preparation
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+    model_inputs = tokenizer([text], return_tensors="pt").to(device)
 
     # Use full precision for higher audio quality
     with torch.no_grad():
@@ -244,7 +252,7 @@ def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, 
         raise ValueError("Generated text is empty. Please provide valid text content.")
 
     try:
-        # Ensure inference is in full precision
+        # Ensure inference is on the correct device
         with torch.no_grad():
             final_wave, final_sample_rate, _ = infer_process(
                 ref_audio,
@@ -279,7 +287,7 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
             if file_type != 'application/epub+zip':
                 sanitized_base = sanitize_filename(os.path.splitext(os.path.basename(epub_path))[0])
                 temp_epub = os.path.join("Working_files", "temp_converted", f"{sanitized_base}.epub")
-                convert_to_epub(epub_path, temp_epub)
+                convert_to_epub(ebook, temp_epub)
                 epub_path = temp_epub
 
             progress(0.1, desc="Extracting text and title from EPUB")
