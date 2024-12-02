@@ -96,7 +96,7 @@ def generate_response(messages, model, tokenizer):
         # Assuming infer_process handles precision internally
         generated_ids = model.generate(
             input_ids=model_inputs.input_ids,
-            max_new_tokens=1024,
+            max_new_tokens=2048,
             temperature=0.5,
             top_p=0.9,
             do_sample=True,  # Enable sampling for more natural responses
