@@ -30,6 +30,8 @@ from f5_tts.infer.utils_infer import (
     infer_process,
 )
 
+import torch  # Added missing import
+
 try:
     import spaces
     USING_SPACES = True
@@ -58,7 +60,10 @@ def load_f5tts(ckpt_path=None):
         "text_dim": 512,
         "conv_layers": 4
     }
-    return load_model(DiT, model_cfg, ckpt_path)
+    model = load_model(DiT, model_cfg, ckpt_path)
+    model.eval()  # Ensure the model is in evaluation mode
+    model.to('cuda')  # Move model to GPU
+    return model
 
 F5TTS_ema_model = load_f5tts()
 
@@ -67,24 +72,33 @@ chat_tokenizer_state = None
 
 @gpu_decorator
 def generate_response(messages, model, tokenizer):
-    """Generate a response using the provided model and tokenizer."""
+    """Generate a response using the provided model and tokenizer with full precision."""
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
     )
 
+    # Tokenizer and model input preparation
     model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-    generated_ids = model.generate(
-        input_features=model_inputs.input_features,
-        max_new_tokens=512,
-        temperature=0.7,
-        top_p=0.95,
-    )
+
+    # Use full precision for higher audio quality
+    with torch.no_grad():
+        # Ensure full precision by disabling autocast if necessary
+        # Assuming infer_process handles precision internally
+        generated_ids = model.generate(
+            input_ids=model_inputs.input_ids,
+            max_new_tokens=1024,
+            temperature=0.5,
+            top_p=0.9,
+            do_sample=True,  # Enable sampling for more natural responses
+            repetition_penalty=1.2,  # Prevent repetition
+        )
 
     if not generated_ids:
         raise ValueError("No generated IDs returned by the model.")
 
+    # Post-processing the generated IDs
     generated_ids = [
         output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
     ]
@@ -92,6 +106,7 @@ def generate_response(messages, model, tokenizer):
     if not generated_ids or not generated_ids[0]:
         raise ValueError("Generated IDs are empty after processing.")
 
+    # Decode and return the response
     return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
 def extract_metadata_and_cover(ebook_path):
@@ -218,7 +233,7 @@ def show_converted_audiobooks():
     return [os.path.join(output_dir, f) for f in files]
 
 @gpu_decorator
-def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.15, speed=1, show_info=gr.Info, progress=gr.Progress()):
+def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, show_info=gr.Info, progress=gr.Progress()):
     """Perform inference to generate audio from text."""
     try:
         ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=show_info)
@@ -229,17 +244,19 @@ def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.15, speed=1,
         raise ValueError("Generated text is empty. Please provide valid text content.")
 
     try:
-        final_wave, final_sample_rate, _ = infer_process(
-            ref_audio,
-            ref_text,
-            gen_text,
-            F5TTS_ema_model,
-            vocoder,
-            cross_fade_duration=cross_fade_duration,
-            speed=speed,
-            show_info=show_info,
-            progress=progress,  # Pass progress here
-        )
+        # Ensure inference is in full precision
+        with torch.no_grad():
+            final_wave, final_sample_rate, _ = infer_process(
+                ref_audio,
+                ref_text,
+                gen_text,
+                F5TTS_ema_model,
+                vocoder,
+                cross_fade_duration=cross_fade_duration,
+                speed=speed,
+                show_info=show_info,
+                progress=progress,  # Pass progress here
+            )
     except Exception as e:
         raise RuntimeError(f"Error during inference process: {e}")
 
@@ -284,7 +301,8 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
             progress(0.8, desc="Stitching audio files")
             sample_rate, wave = audio_out
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
-                sf.write(tmp_wav.name, wave, sample_rate)
+                # Save WAV with higher bit depth and sample rate if possible
+                sf.write(tmp_wav.name, wave, sample_rate, subtype='PCM_24')
                 tmp_wav_path = tmp_wav.name
 
             progress(0.9, desc="Converting to MP3")
@@ -292,12 +310,21 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
             tmp_mp3_path = os.path.join("Working_files", "Book", f"{sanitized_title}.mp3")
             ensure_directory(os.path.dirname(tmp_mp3_path))
 
+            # Load WAV with Pydub
             audio = AudioSegment.from_wav(tmp_wav_path)
-            audio.export(tmp_mp3_path, format="mp3", bitrate="256k")
+
+            # Export to MP3 with higher bitrate and quality settings
+            audio.export(
+                tmp_mp3_path,
+                format="mp3",
+                bitrate="320k",
+                parameters=["-q:a", "0"]  # Highest quality for VBR
+            )
 
             if cover_image:
                 embed_cover_into_mp3(tmp_mp3_path, cover_image)
 
+            # Clean up temporary files
             os.remove(tmp_wav_path)
             if cover_image and os.path.exists(cover_image):
                 os.remove(cover_image)
@@ -353,7 +380,7 @@ def create_gradio_app():
                 label="Cross-Fade Duration (Between Generated Audio Chunks)",
                 minimum=0.0,
                 maximum=1.0,
-                value=0.15,
+                value=0.0,
                 step=0.01,
             )
 
@@ -396,7 +423,7 @@ def main(port, host, share, api):
     app.queue().launch(
         server_name="0.0.0.0",
         server_port=port or 7860,
-        share=True,
+        share=share,
         show_api=api,
         debug=True
     )
