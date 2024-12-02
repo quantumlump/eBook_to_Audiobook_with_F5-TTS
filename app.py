@@ -94,34 +94,6 @@ def generate_response(messages, model, tokenizer):
 
     return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-@gpu_decorator
-def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.15, speed=1, show_info=gr.Info):
-    """Perform inference to generate audio from text."""
-    try:
-        ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=show_info)
-    except Exception as e:
-        raise RuntimeError(f"Error in preprocessing reference audio and text: {e}")
-
-    if not gen_text.strip():
-        raise ValueError("Generated text is empty. Please provide valid text content.")
-
-    try:
-        final_wave, final_sample_rate, _ = infer_process(
-            ref_audio,
-            ref_text,
-            gen_text,
-            F5TTS_ema_model,
-            vocoder,
-            cross_fade_duration=cross_fade_duration,
-            speed=speed,
-            show_info=show_info,
-            progress=gr.Progress(),
-        )
-    except Exception as e:
-        raise RuntimeError(f"Error during inference process: {e}")
-
-    return (final_sample_rate, final_wave), ref_text
-
 def extract_metadata_and_cover(ebook_path):
     """Extract cover image from the eBook."""
     try:
@@ -157,23 +129,6 @@ def embed_cover_into_mp3(mp3_path, cover_image_path):
         print(f"Embedded cover image into {mp3_path}")
     except Exception as e:
         print(f"Failed to embed cover image into MP3: {e}")
-
-def create_m4b(combined_wav, metadata_file, cover_image, output_m4b):
-    """Create an M4B audiobook from WAV, metadata, and cover image."""
-    os.makedirs(os.path.dirname(output_m4b), exist_ok=True)
-    
-    ffmpeg_cmd = ['ffmpeg', '-i', combined_wav, '-i', metadata_file]
-    if cover_image:
-        ffmpeg_cmd += ['-i', cover_image, '-map', '0:a', '-map', '2:v']
-    else:
-        ffmpeg_cmd += ['-map', '0:a']
-    
-    ffmpeg_cmd += ['-map_metadata', '1', '-c:a', 'aac', '-b:a', '192k']
-    if cover_image:
-        ffmpeg_cmd += ['-c:v', 'png', '-disposition:v', 'attached_pic']
-    ffmpeg_cmd += [output_m4b]
-    
-    subprocess.run(ffmpeg_cmd, check=True)
 
 def extract_text_and_title_from_epub(epub_path):
     """Extract text and title from an EPUB file."""
@@ -262,130 +217,43 @@ def show_converted_audiobooks():
 
     return [os.path.join(output_dir, f) for f in files]
 
-def combine_wav_files(input_directory, output_directory, file_name):
-    """Combine multiple WAV files into a single WAV file."""
-    os.makedirs(output_directory, exist_ok=True)
-    output_file_path = os.path.join(output_directory, file_name)
-    combined_audio = AudioSegment.empty()
+@gpu_decorator
+def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.15, speed=1, show_info=gr.Info, progress=gr.Progress()):
+    """Perform inference to generate audio from text."""
+    try:
+        ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=show_info)
+    except Exception as e:
+        raise RuntimeError(f"Error in preprocessing reference audio and text: {e}")
 
-    input_files = sorted(
-        [os.path.join(input_directory, f) for f in os.listdir(input_directory) if f.endswith(".wav")],
-        key=lambda f: int(''.join(filter(str.isdigit, f)))
-    )
+    if not gen_text.strip():
+        raise ValueError("Generated text is empty. Please provide valid text content.")
 
-    for file_path in input_files:
-        combined_audio += AudioSegment.from_wav(file_path)
+    try:
+        final_wave, final_sample_rate, _ = infer_process(
+            ref_audio,
+            ref_text,
+            gen_text,
+            F5TTS_ema_model,
+            vocoder,
+            cross_fade_duration=cross_fade_duration,
+            speed=speed,
+            show_info=show_info,
+            progress=progress,  # Pass progress here
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error during inference process: {e}")
 
-    combined_audio.export(output_file_path, format='wav')
-    print(f"Combined audio saved to {output_file_path}")
-
-def split_long_sentence(sentence, max_length=249, max_pauses=30):
-    """Split long sentences into manageable parts."""
-    parts = []
-    while len(sentence) > max_length or sentence.count(',') + sentence.count(';') + sentence.count('.') > max_pauses:
-        possible_splits = [i for i, char in enumerate(sentence) if char in ',;.' and i < max_length]
-        split_at = possible_splits[-1] + 1 if possible_splits else max_length
-        parts.append(sentence[:split_at].strip())
-        sentence = sentence[split_at:].strip()
-    parts.append(sentence)
-    return parts
-
-def create_chapter_labeled_book(ebook_file_path):
-    """Create a chapter-labeled book from an ebook file."""
-    ensure_directory(os.path.join(".", 'Working_files', 'Book'))
-
-    def save_chapters_as_text(epub_path):
-        directory = os.path.join(".", "Working_files", "temp_ebook")
-        ensure_directory(directory)
-
-        previous_filename = ''
-        chapter_counter = 0
-
-        for item in epub.read_epub(epub_path).get_items():
-            if item.get_type() == ITEM_DOCUMENT:
-                try:
-                    soup = BeautifulSoup(item.get_content(), 'html.parser')
-                    text = soup.get_text()
-                    if text.strip():
-                        if len(text) < 2300 and previous_filename:
-                            with open(previous_filename, 'a', encoding='utf-8') as file:
-                                file.write('\n' + text)
-                        else:
-                            previous_filename = os.path.join(directory, f"chapter_{chapter_counter}.txt")
-                            chapter_counter += 1
-                            with open(previous_filename, 'w', encoding='utf-8') as file:
-                                file.write(text)
-                                print(f"Saved chapter: {previous_filename}")
-                except Exception as e:
-                    print(f"Error processing chapter: {e}")
-
-    input_ebook = ebook_file_path
-    output_epub = os.path.join(".", "Working_files", "temp.epub")
-
-    if os.path.exists(output_epub):
-        os.remove(output_epub)
-        print(f"Removed existing file: {output_epub}")
-
-    if convert_to_epub(input_ebook, output_epub):
-        save_chapters_as_text(output_epub)
-
-    def process_chapter_files(folder_path, output_csv):
-        with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(['Text', 'Start Location', 'End Location', 'Is Quote', 'Speaker', 'Chapter'])
-
-            chapter_files = sorted(
-                [f for f in os.listdir(folder_path) if f.startswith('chapter_') and f.endswith('.txt')],
-                key=lambda x: int(re.search(r'chapter_(\d+)\.txt', x).group(1))
-            )
-
-            for filename in chapter_files:
-                chapter_number = int(re.search(r'chapter_(\d+)\.txt', filename).group(1))
-                file_path = os.path.join(folder_path, filename)
-
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as file:
-                        text = file.read()
-                        if text:
-                            text = "NEWCHAPTERABC" + text
-                        sentences = nltk.tokenize.sent_tokenize(text)
-                        for sentence in sentences:
-                            start = text.find(sentence)
-                            end = start + len(sentence)
-                            writer.writerow([sentence, start, end, 'True', 'Narrator', chapter_number])
-                except Exception as e:
-                    print(f"Error processing {filename}: {e}")
-
-    folder_path = os.path.join(".", "Working_files", "temp_ebook")
-    output_csv = os.path.join(".", "Working_files", "Book", "Other_book.csv")
-    process_chapter_files(folder_path, output_csv)
-
-    def sort_key(filename):
-        match = re.search(r'chapter_(\d+)\.txt', filename)
-        return int(match.group(1)) if match else 0
-
-    def combine_chapters(input_folder, output_file):
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        files = sorted([f for f in os.listdir(input_folder) if f.endswith(".txt")], key=sort_key)
-
-        with open(output_file, 'w', encoding='utf-8') as outfile:
-            for i, filename in enumerate(files):
-                with open(os.path.join(input_folder, filename), 'r', encoding='utf-8') as infile:
-                    outfile.write(infile.read())
-                    if i < len(files) - 1:
-                        outfile.write("\nNEWCHAPTERABC\n")
-
-    output_file = os.path.join(".", 'Working_files', 'Book', 'Chapter_Book.txt')
-    combine_chapters(folder_path, output_file)
-    ensure_directory(os.path.join(".", "Working_files", "Book"))
+    return (final_sample_rate, final_wave), ref_text
 
 @gpu_decorator
-def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_duration, speed):
+def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_duration, speed, progress=gr.Progress()):
     """Main function to convert eBooks to audiobooks."""
     try:
         generated_files = []
 
-        for ebook in gen_file_input:
+        num_ebooks = len(gen_file_input)
+        for idx, ebook in enumerate(gen_file_input):
+            progress(0, desc=f"Processing ebook {idx+1}/{num_ebooks}")
             epub_path = ebook
             if not os.path.exists(epub_path):
                 raise FileNotFoundError(f"File not found: {epub_path}")
@@ -397,24 +265,29 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
                 convert_to_epub(epub_path, temp_epub)
                 epub_path = temp_epub
 
+            progress(0.1, desc="Extracting text and title from EPUB")
             gen_text, ebook_title = extract_text_and_title_from_epub(epub_path)
             cover_image = extract_metadata_and_cover(epub_path)
 
             ref_text = ref_text_input or ""
 
+            progress(0.2, desc="Starting inference")
             audio_out, _ = infer(
                 ref_audio_input,
                 ref_text,
                 gen_text,
                 cross_fade_duration,
                 speed,
+                progress=progress,  # Pass progress here
             )
 
+            progress(0.8, desc="Stitching audio files")
             sample_rate, wave = audio_out
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
                 sf.write(tmp_wav.name, wave, sample_rate)
                 tmp_wav_path = tmp_wav.name
 
+            progress(0.9, desc="Converting to MP3")
             sanitized_title = sanitize_filename(ebook_title) or f"audiobook_{int(tempfile._get_default_tempdir())}"
             tmp_mp3_path = os.path.join("Working_files", "Book", f"{sanitized_title}.mp3")
             ensure_directory(os.path.dirname(tmp_mp3_path))
@@ -430,6 +303,7 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
                 os.remove(cover_image)
 
             generated_files.append(tmp_mp3_path)
+            progress(1, desc="Completed processing ebook")
 
         audiobooks = show_converted_audiobooks()
         last_file = generated_files[-1] if generated_files else None
@@ -458,7 +332,7 @@ def create_gradio_app():
         )
 
         generate_btn = gr.Button("Start", variant="primary")
-        audio_output = gr.Files(label="Inference Progress (After 100%, Audio Chunks are Stitched)")
+        audio_output = gr.Files(label="Progress")
 
         show_audiobooks_btn = gr.Button("Show All Completed Audiobooks", variant="secondary")
         audiobooks_output = gr.Files(label="Converted Audiobooks (Download Links ->)")
@@ -495,6 +369,7 @@ def create_gradio_app():
                 speed_slider,
             ],
             outputs=[audio_output, player, audiobooks_output],
+            show_progress=True,  # Enable progress bar
         )
 
         show_audiobooks_btn.click(
@@ -523,7 +398,7 @@ def main(port, host, share, api):
     app.queue().launch(
         server_name="0.0.0.0",
         server_port=port or 7860,
-        share=share,
+        share=True,
         show_api=api,
         debug=True
     )
@@ -536,3 +411,5 @@ if __name__ == "__main__":
     else:
         app = create_gradio_app()
         app.queue().launch(debug=True)
+
+
