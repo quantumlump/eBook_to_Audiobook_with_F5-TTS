@@ -234,11 +234,11 @@ def show_converted_audiobooks():
     if not os.path.exists(output_dir):
         return ["No audiobooks found."]
 
-    files = [f for f in os.listdir(output_dir) if f.endswith(('.mp3', '.m4b'))]
+    files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.endswith(('.mp3', '.m4b'))]
     if not files:
         return ["No audiobooks found."]
 
-    return [os.path.join(output_dir, f) for f in files]
+    return files
 
 @gpu_decorator
 def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, show_info=gr.Info, progress=gr.Progress()):
@@ -274,8 +274,7 @@ def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, 
 def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_duration, speed, progress=gr.Progress()):
     """Main function to convert eBooks to audiobooks."""
     try:
-        last_file = None
-
+        processed_audiobooks = []
         num_ebooks = len(gen_file_input)
         for idx, ebook in enumerate(gen_file_input):
             progress(0, desc=f"Processing ebook {idx+1}/{num_ebooks}")
@@ -337,12 +336,12 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
             if cover_image and os.path.exists(cover_image):
                 os.remove(cover_image)
 
-            last_file = tmp_mp3_path
-            progress(1, desc="Completed processing ebook")
+            processed_audiobooks.append(tmp_mp3_path)
+            progress(1, desc=f"Completed processing ebook {idx+1}/{num_ebooks}")
 
-        audiobooks = show_converted_audiobooks()
-
-        return last_file, audiobooks
+            # Yield the outputs after processing each ebook
+            player_audio = tmp_mp3_path  # Path to the latest audio file
+            yield player_audio, processed_audiobooks  # Yield the updated outputs
 
     except Exception as e:
         print(f"An error occurred: {e}")
@@ -365,11 +364,12 @@ def create_gradio_app():
             file_count="multiple",
         )
 
-        generate_btn = gr.Button("Start", variant="primary")
+        # Arrange the two buttons side by side using gr.Row
+        with gr.Row():
+            generate_btn = gr.Button("Start", variant="primary")
+            show_audiobooks_btn = gr.Button("Show All Completed Audiobooks", variant="secondary")
 
-        show_audiobooks_btn = gr.Button("Show All Completed Audiobooks", variant="secondary")
-        audiobooks_output = gr.Files(label="Converted Audiobooks (Download Links ->)")
-
+        audiobooks_output = gr.Files(label="Converted Audiobooks (Download Links)")
         player = gr.Audio(label="Play Latest Converted Audiobook", interactive=False)
 
         with gr.Accordion("Advanced Settings", open=False):
