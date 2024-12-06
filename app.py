@@ -87,26 +87,25 @@ def generate_response(messages, model, tokenizer):
         add_generation_prompt=True,
     )
 
-    # Tokenizer and model input preparation
     model_inputs = tokenizer([text], return_tensors="pt").to(device)
 
-    # Use full precision for higher audio quality
+    # Increase max_new_tokens to a much larger number to avoid truncation
+    # Previously: max_new_tokens=1024
+    max_new_tokens = 1000000  # Large number to allow full generation
+
     with torch.no_grad():
-        # Ensure full precision by disabling autocast if necessary
-        # Assuming infer_process handles precision internally
         generated_ids = model.generate(
             input_ids=model_inputs.input_ids,
-            max_new_tokens=2048,
+            max_new_tokens=max_new_tokens,
             temperature=0.5,
             top_p=0.9,
-            do_sample=True,  # Enable sampling for more natural responses
-            repetition_penalty=1.2,  # Prevent repetition
+            do_sample=True,
+            repetition_penalty=1.2,
         )
 
     if not generated_ids:
         raise ValueError("No generated IDs returned by the model.")
 
-    # Post-processing the generated IDs
     generated_ids = [
         output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
     ]
@@ -114,7 +113,6 @@ def generate_response(messages, model, tokenizer):
     if not generated_ids or not generated_ids[0]:
         raise ValueError("Generated IDs are empty after processing.")
 
-    # Decode and return the response
     return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
 def extract_metadata_and_cover(ebook_path):
@@ -135,26 +133,24 @@ def embed_cover_into_mp3(mp3_path, cover_image_path):
     except error:
         audio = ID3()
 
-    # Remove existing APIC frames to avoid duplicates
     audio.delall("APIC")
 
     try:
         with open(cover_image_path, 'rb') as img:
             audio.add(APIC(
-                encoding=3,          # 3 is for UTF-8
-                mime='image/jpeg',   # Image MIME type
-                type=3,              # 3 is for front cover
-                desc='Front cover',  # Description
+                encoding=3,          
+                mime='image/jpeg',   
+                type=3,              
+                desc='Front cover',  
                 data=img.read()
             ))
-        # Save with ID3v2.3 for better compatibility
         audio.save(mp3_path, v2_version=3)
         print(f"Embedded cover image into {mp3_path}")
     except Exception as e:
         print(f"Failed to embed cover image into MP3: {e}")
 
 def extract_text_and_title_from_epub(epub_path):
-    """Extract text and title from an EPUB file."""
+    """Extract full text and title from an EPUB file in reading order."""
     try:
         book = epub.read_epub(epub_path)
         print(f"EPUB '{epub_path}' successfully read.")
@@ -176,15 +172,15 @@ def extract_text_and_title_from_epub(epub_path):
         title = os.path.splitext(os.path.basename(epub_path))[0]
         print(f"Using filename as title: {title}")
 
-    for item in book.get_items():
-        if item.get_type() == ITEM_DOCUMENT:
+    # Iterate over the book's spine in reading order
+    for spine_item in book.spine:
+        item = book.get_item_with_id(spine_item[0])
+        if item and item.get_type() == ITEM_DOCUMENT:
             try:
                 soup = BeautifulSoup(item.get_content(), 'html.parser')
                 text = soup.get_text(separator=' ', strip=True)
                 if text:
                     text_content.append(text)
-                else:
-                    print(f"No text in document item {item.get_id()}.")
             except Exception as e:
                 print(f"Error parsing document item {item.get_id()}: {e}")
 
@@ -242,7 +238,7 @@ def show_converted_audiobooks():
 
 @gpu_decorator
 def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, show_info=gr.Info, progress=gr.Progress()):
-    """Perform inference to generate audio from text."""
+    """Perform inference to generate audio from text without truncation."""
     try:
         ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=show_info)
     except Exception as e:
@@ -252,7 +248,6 @@ def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, 
         raise ValueError("Generated text is empty. Please provide valid text content.")
 
     try:
-        # Ensure inference is on the correct device
         with torch.no_grad():
             final_wave, final_sample_rate, _ = infer_process(
                 ref_audio,
@@ -263,16 +258,19 @@ def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, 
                 cross_fade_duration=cross_fade_duration,
                 speed=speed,
                 show_info=show_info,
-                progress=progress,  # Pass progress here
+                progress=progress,
             )
     except Exception as e:
         raise RuntimeError(f"Error during inference process: {e}")
+
+    # Log the length of the generated audio for debugging
+    print(f"Generated audio length: {len(final_wave)} samples at {final_sample_rate} Hz.")
 
     return (final_sample_rate, final_wave), ref_text
 
 @gpu_decorator
 def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_duration, speed, progress=gr.Progress()):
-    """Main function to convert eBooks to audiobooks."""
+    """Main function to convert eBooks to audiobooks with full text processing."""
     try:
         processed_audiobooks = []
         num_ebooks = len(gen_file_input)
@@ -302,14 +300,13 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
                 gen_text,
                 cross_fade_duration,
                 speed,
-                progress=progress,  # Pass progress here
+                progress=progress,
             )
 
             progress(0.8, desc="Stitching audio files")
             sample_rate, wave = audio_out
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
-                # Save WAV with higher bit depth and sample rate if possible
-                sf.write(tmp_wav.name, wave, sample_rate, subtype='PCM_24')
+                sf.write(tmp_wav.name, wave, sample_rate)
                 tmp_wav_path = tmp_wav.name
 
             progress(0.9, desc="Converting to MP3")
@@ -317,21 +314,17 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
             tmp_mp3_path = os.path.join("Working_files", "Book", f"{sanitized_title}.mp3")
             ensure_directory(os.path.dirname(tmp_mp3_path))
 
-            # Load WAV with Pydub
             audio = AudioSegment.from_wav(tmp_wav_path)
-
-            # Export to MP3 with higher bitrate and quality settings
             audio.export(
                 tmp_mp3_path,
                 format="mp3",
                 bitrate="320k",
-                parameters=["-q:a", "0"]  # Highest quality for VBR
+                parameters=["-q:a", "0"]  
             )
 
             if cover_image:
                 embed_cover_into_mp3(tmp_mp3_path, cover_image)
 
-            # Clean up temporary files
             os.remove(tmp_wav_path)
             if cover_image and os.path.exists(cover_image):
                 os.remove(cover_image)
@@ -339,9 +332,7 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
             processed_audiobooks.append(tmp_mp3_path)
             progress(1, desc=f"Completed processing ebook {idx+1}/{num_ebooks}")
 
-            # Yield the outputs after processing each ebook
-            player_audio = tmp_mp3_path  # Path to the latest audio file
-            yield player_audio, processed_audiobooks  # Yield the updated outputs
+            yield tmp_mp3_path, processed_audiobooks
 
     except Exception as e:
         print(f"An error occurred: {e}")
@@ -364,7 +355,6 @@ def create_gradio_app():
             file_count="multiple",
         )
 
-        # Arrange the two buttons side by side using gr.Row
         with gr.Row():
             generate_btn = gr.Button("Start", variant="primary")
             show_audiobooks_btn = gr.Button("Show All Completed Audiobooks", variant="secondary")
@@ -402,7 +392,7 @@ def create_gradio_app():
                 speed_slider,
             ],
             outputs=[player, audiobooks_output],
-            show_progress=True,  # Enable progress bar
+            show_progress=True,
         )
 
         show_audiobooks_btn.click(
