@@ -421,7 +421,7 @@ def main(port, host, share, api):
     app.queue().launch(
         server_name="0.0.0.0",
         server_port=port or 7860,
-        share=share,
+        share=True,
         show_api=api,
         debug=True
     )
