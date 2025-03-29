@@ -78,12 +78,17 @@ COPY requirements.txt .
 # Copy the extracted working f5-tts code into the image
 COPY ./f5_tts_working_code /usr/local/lib/python3.10/site-packages/f5_tts
 
+COPY default_voice.mp3 /app/default_voice.mp3
+
+COPY preload_models.py /app/preload_models.py
+
 # Install Python dependencies
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir --verbose -r requirements.txt
 
 # Download NLTK data
 RUN python -m nltk.downloader punkt
+RUN python /app/preload_models.py
 
 # Copy your application files
 COPY app.py .
