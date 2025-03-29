@@ -338,6 +338,10 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
         print(f"An error occurred: {e}")
         raise e
 
+DEFAULT_REF_AUDIO_PATH = "/app/default_voice.mp3" 
+DEFAULT_REF_TEXT = "For thirty-six years I was the confidential secretary of the Roman statesman Cicero. At first this was exciting, then astonishing, then arduous, and finally extremely dangerous."
+
+
 def create_gradio_app():
     """Create and configure the Gradio application."""
     with gr.Blocks(theme=gr.themes.Ocean()) as app:
@@ -345,7 +349,8 @@ def create_gradio_app():
 
         ref_audio_input = gr.Audio(
             label="Upload Voice File (<15 sec) or Record with Mic Icon (Ensure Natural Phrasing, Trim Silence)",
-            type="filepath"
+            type="filepath",
+            value=DEFAULT_REF_AUDIO_PATH
         )
 
         gen_file_input = gr.Files(
@@ -366,6 +371,7 @@ def create_gradio_app():
             ref_text_input = gr.Textbox(
                 label="Reference Text (Leave Blank for Automatic Transcription)",
                 lines=2,
+                value=DEFAULT_REF_TEXT
             )
             speed_slider = gr.Slider(
                 label="Speech Speed (Adjusting Can Cause Artifacts)",
