@@ -75,6 +75,9 @@ RUN mkdir -p /app/Working_files/Book /app/Working_files/temp_ebook /app/Working_
 # Copy the requirements file
 COPY requirements.txt .
 
+# Copy the extracted working f5-tts code into the image
+COPY ./f5_tts_working_code /usr/local/lib/python3.10/site-packages/f5_tts
+
 # Install Python dependencies
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir --verbose -r requirements.txt
