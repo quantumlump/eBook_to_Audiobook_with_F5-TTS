@@ -76,7 +76,7 @@ multidict==6.1.0
 multiprocess==0.70.16
 mutagen==1.47.0
 networkx==3.4.2
-nltk==3.8.1
+nltk==3.9.1
 numba==0.60.0
 numpy==1.26.4
 nvidia-cublas-cu12==12.4.5.8

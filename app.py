@@ -1,13 +1,10 @@
-# -*- coding: utf-8 -*-
 import os
 import re
 import tempfile
 import subprocess
 import csv
-import gc # Import garbage collector
 from collections import OrderedDict
-# from importlib.resources import files # No longer needed?
-import shutil # For removing directories
+from importlib.resources import files
 
 import click
 import gradio as gr
@@ -15,40 +12,15 @@ import numpy as np
 import soundfile as sf
 import torchaudio
 from cached_path import cached_path
-# from transformers import AutoModelForCausalLM, AutoTokenizer # Not directly used here
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ebooklib import epub, ITEM_DOCUMENT
 from bs4 import BeautifulSoup
 import nltk
-try:
-    # Check if 'punkt' resource is available
-    nltk.data.find('tokenizers/punkt')
-    print("NLTK 'punkt' resource found.")
-except LookupError:
-    print("NLTK 'punkt' resource not found. Attempting download...")
-    try:
-        # Ensure NLTK_DATA is set if running in an env where it might not be obvious
-        nltk_data_path = os.environ.get('NLTK_DATA', None)
-        if nltk_data_path:
-            print(f"Using NLTK_DATA path: {nltk_data_path}")
-            # Ensure the specific download directory exists if specified
-            if ":" in nltk_data_path: # Handle multiple paths if present
-                nltk_data_path = nltk_data_path.split(":")[0]
-            os.makedirs(os.path.join(nltk_data_path, 'tokenizers'), exist_ok=True)
-            nltk.download('punkt', quiet=False, download_dir=nltk_data_path)
-        else:
-            nltk.download('punkt', quiet=False) # Download explicitly if missing, show output
-        # Verify download
-        nltk.data.find('tokenizers/punkt')
-        print("'punkt' resource downloaded successfully.")
-    except Exception as download_e:
-        print(f"Failed to download NLTK 'punkt' resource: {download_e}. Text splitting may fall back to paragraphs.")
-
-
 from nltk.tokenize import sent_tokenize
-# from pydub import AudioSegment # No longer needed for stitching
+from pydub import AudioSegment
 import magic
-from mutagen.id3 import ID3, APIC, error, TIT2, TPE1 # <<< Added TIT2 (Title) and TPE1 (Artist/Author)
+from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, error
 
 from f5_tts.model import DiT
 from f5_tts.infer.utils_infer import (
@@ -58,8 +30,7 @@ from f5_tts.infer.utils_infer import (
     infer_process,
 )
 
-import torch
-import pkg_resources # Added for version checking
+import torch  # Added missing import
 
 # Determine the available device (GPU or CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -76,562 +47,604 @@ except ImportError:
 
 DEFAULT_TTS_MODEL = "F5-TTS"
 
-# --- Constants ---
-MAX_CHUNK_LENGTH = 750 # Default chunk length, can be overridden by UI
-OUTPUT_DIR = os.path.join("Working_files", "Book")
-TEMP_CONVERT_DIR = os.path.join("Working_files", "temp_converted")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(TEMP_CONVERT_DIR, exist_ok=True)
-
-
 # GPU Decorator
 def gpu_decorator(func):
     if USING_SPACES:
         return spaces.GPU(func)
     return func
 
-# Load models (globally)
-print("Loading Vocoder...")
+# Load models
 vocoder = load_vocoder()
-print("Vocoder loaded.")
 
 def load_f5tts(ckpt_path=None):
     if ckpt_path is None:
         ckpt_path = str(cached_path("hf://SWivid/F5-TTS/F5TTS_Base/model_1200000.safetensors"))
     model_cfg = {
-        "dim": 1024, "depth": 22, "heads": 16, "ff_mult": 2,
-        "text_dim": 512, "conv_layers": 4
+        "dim": 1024,
+        "depth": 22,
+        "heads": 16,
+        "ff_mult": 2,
+        "text_dim": 512,
+        "conv_layers": 4
     }
-    print(f"Loading F5-TTS model from {ckpt_path}...")
     model = load_model(DiT, model_cfg, ckpt_path)
-    model.eval()
-    model = model.to(device)
-    print(f"F5-TTS Model loaded on {device}.")
+    model.eval()  # Ensure the model is in evaluation mode
+    model = model.to(device)  # Move model to the selected device
+    print(f"Model loaded on {device}.")
     return model
 
 F5TTS_ema_model = load_f5tts()
 
-# --- Utility Functions (Extraction, Conversion, etc.) ---
+chat_model_state = None
+chat_tokenizer_state = None
+
+@gpu_decorator
+def generate_response(messages, model, tokenizer):
+    """Generate a response using the provided model and tokenizer with full precision."""
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    model_inputs = tokenizer([text], return_tensors="pt").to(device)
+
+    # Increase max_new_tokens to a much larger number to avoid truncation
+    # Previously: max_new_tokens=1024
+    max_new_tokens = 1000000  # Large number to allow full generation
+
+    with torch.no_grad():
+        generated_ids = model.generate(
+            input_ids=model_inputs.input_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=0.5,
+            top_p=0.9,
+            do_sample=True,
+            repetition_penalty=1.2,
+        )
+
+    if not generated_ids:
+        raise ValueError("No generated IDs returned by the model.")
+
+    generated_ids = [
+        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    ]
+
+    if not generated_ids or not generated_ids[0]:
+        raise ValueError("Generated IDs are empty after processing.")
+
+    return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
 def extract_metadata_and_cover(ebook_path):
-    """Extract cover image from the eBook. Returns path or None."""
-    print(f"Attempting to extract cover from: {ebook_path}")
-    cover_path = None # Initialize cover_path
+    """Extract cover image from the eBook."""
     try:
-        # Create temp file within the persistent temp_converted dir to avoid potential OS restrictions on /tmp
-        temp_cover_dir = TEMP_CONVERT_DIR
-        ensure_directory(temp_cover_dir)
-        # Use NamedTemporaryFile but ensure it's created in our accessible directory
-        with tempfile.NamedTemporaryFile(dir=temp_cover_dir, suffix=".jpg", delete=False) as tmp_cover:
-            cover_path = tmp_cover.name
-        print(f"Temporary cover path: {cover_path}")
-
-        command = ['ebook-meta', ebook_path, '--get-cover', cover_path]
-        print(f"Running command: {' '.join(command)}")
-        result = subprocess.run(command, check=False, capture_output=True, text=True, encoding='utf-8', errors='ignore')
-        if result.returncode == 0 and os.path.exists(cover_path) and os.path.getsize(cover_path) > 0:
-            print(f"Cover successfully extracted to {cover_path}")
+        cover_path = os.path.splitext(ebook_path)[0] + '.jpg'
+        subprocess.run(['ebook-meta', ebook_path, '--get-cover', cover_path], check=True)
+        if os.path.exists(cover_path):
             return cover_path
-        else:
-            print(f"Failed to extract cover. RC: {result.returncode}, Stderr: {result.stderr}, Stdout: {result.stdout}")
-            if cover_path and os.path.exists(cover_path): os.remove(cover_path)
-            return None
-    except FileNotFoundError:
-        print(f"Error: 'ebook-meta' command not found. Is Calibre installed and in PATH?")
-        if cover_path and os.path.exists(cover_path):
-             try: os.remove(cover_path)
-             except OSError: pass
-        return None
     except Exception as e:
         print(f"Error extracting eBook cover: {e}")
-        if cover_path and os.path.exists(cover_path):
-            try: os.remove(cover_path)
-            except OSError: pass
-        return None
+    return None
 
-def embed_metadata_into_mp3(mp3_path, cover_image_path, title, author):
-    """Embed cover image, title, and author into the MP3 file's metadata."""
-    if not mp3_path or not os.path.exists(mp3_path):
-        print("MP3 path invalid/missing. Skipping metadata embedding.")
-        return
-    print(f"Attempting to embed metadata into {mp3_path}")
+def embed_metadata_into_mp3(mp3_path, cover_image_path, title, author, album_title=None):
+    """Embed cover image, title, author, and album into the MP3 file's metadata."""
     try:
         audio = ID3(mp3_path)
-    except error as e:
-        print(f"Error loading ID3 tags from {mp3_path}, creating new. Error: {e}")
-        try:
-            audio = ID3()
-        except Exception as create_e:
-            print(f"Failed to create new ID3 tags for {mp3_path}. Error: {create_e}")
-            return
+    except error: # If no ID3 tag exists, create one
+        audio = ID3()
+    except Exception as e:
+        print(f"Error loading ID3 tags for {mp3_path}: {e}. Creating new tags.")
+        audio = ID3() # Fallback to creating new tags
 
-    # Embed Cover Image
+    # Add Title
+    audio.delall("TIT2") # Remove existing title tags
+    audio.add(TIT2(encoding=3, text=title))
+    print(f"Set TIT2 (Title) to: {title}")
+
+    # Add Author/Artist
+    audio.delall("TPE1") # Remove existing artist tags
+    audio.add(TPE1(encoding=3, text=author))
+    print(f"Set TPE1 (Author/Artist) to: {author}")
+
+    # Add Album (often used for Book Title in audiobook players)
+    # If a specific album_title is provided, use it. Otherwise, use the main title.
+    album_to_set = album_title if album_title else title
+    audio.delall("TALB") # Remove existing album tags
+    audio.add(TALB(encoding=3, text=album_to_set))
+    print(f"Set TALB (Album) to: {album_to_set}")
+
+    # Embed Cover Image (existing logic)
     if cover_image_path and os.path.exists(cover_image_path):
+        audio.delall("APIC") # Remove existing cover art
         try:
-            audio.delall("APIC") # Remove existing cover art
             with open(cover_image_path, 'rb') as img:
-                image_data = img.read()
-            mime_type = magic.from_buffer(image_data, mime=True)
-            if mime_type not in ['image/jpeg', 'image/png']:
-                print(f"Warning: Cover MIME type {mime_type}, expected jpeg/png.")
-            audio.add(APIC(encoding=3, mime=mime_type, type=3, desc='Front cover', data=image_data))
-            print(f"Successfully prepared cover image for embedding.")
-        except error as e:
-            print(f"Mutagen ID3 Error preparing cover: {e}")
+                audio.add(APIC(
+                    encoding=3,          # 3 is for UTF-8
+                    mime='image/jpeg',   # or 'image/png'
+                    type=3,              # 3 means front cover
+                    desc='Front cover',
+                    data=img.read()
+                ))
+            print(f"Embedded cover image into {mp3_path}")
         except Exception as e:
-            print(f"Failed to prepare cover image for embedding: {e}")
+            print(f"Failed to embed cover image into MP3: {e}")
     else:
-        print("Cover image path invalid/missing or file doesn't exist. Skipping cover embedding.")
+        print(f"No cover image provided or found at '{cover_image_path}'. Skipping cover embedding.")
+        audio.delall("APIC") # Ensure no old APIC tag remains if new cover is not set
 
-    # Embed Title
-    if title:
-        audio.delall("TIT2") # Remove existing title
-        audio.add(TIT2(encoding=3, text=title))
-        print(f"Successfully prepared title '{title}' for embedding.")
-    else:
-        print("Title is empty. Skipping title embedding.")
-
-    # Embed Author
-    if author:
-        audio.delall("TPE1") # Remove existing artist/author
-        audio.add(TPE1(encoding=3, text=author))
-        print(f"Successfully prepared author '{author}' for embedding.")
-    else:
-        print("Author is empty. Skipping author embedding.")
-
-    # Save changes
     try:
+        # Save with ID3v2.3 for broad compatibility
         audio.save(mp3_path, v2_version=3)
         print(f"Successfully saved metadata to {mp3_path}")
-    except error as e:
-         print(f"Mutagen ID3 Error saving metadata: {e}")
     except Exception as e:
-        print(f"Failed to save metadata to MP3: {e}")
+        print(f"Failed to save MP3 metadata: {e}")
 
-def extract_text_title_author_from_epub(epub_path):
+def extract_text_and_title_from_epub(epub_path):
     """Extract full text, title, and author from an EPUB file in reading order."""
     try:
         book = epub.read_epub(epub_path)
-        print(f"EPUB '{os.path.basename(epub_path)}' successfully read.")
+        print(f"EPUB '{epub_path}' successfully read.")
     except Exception as e:
-        raise RuntimeError(f"Failed to read EPUB file '{epub_path}': {e}")
+        raise RuntimeError(f"Failed to read EPUB file: {e}")
 
     text_content = []
-    title = "Untitled Audiobook"
-    author = "Unknown Author"
+    title = None
+    author = None # Initialize author
 
     try:
-        metadata_title = book.get_metadata('DC', 'title')
-        if metadata_title: title = metadata_title[0][0]
-        else: title = os.path.splitext(os.path.basename(epub_path))[0]
-        print(f"Using title: {title}")
-    except Exception as e:
-        print(f"Could not get title metadata ({e}). Using filename as fallback.")
-        title = os.path.splitext(os.path.basename(epub_path))[0]
-
-    try:
-        metadata_creator = book.get_metadata('DC', 'creator')
-        if metadata_creator: author = ", ".join([creator[0] for creator in metadata_creator])
+        # Extract title
+        title_metadata = book.get_metadata('DC', 'title')
+        if title_metadata:
+            title = title_metadata[0][0]
+            print(f"Extracted title: {title}")
         else:
-             author_meta = book.get_metadata('OPF', 'creator')
-             if author_meta: author = author_meta[0][0]
-             else: print("Author metadata ('DC:creator') not found. Keeping default.")
-        print(f"Using author: {author}")
-    except Exception as e:
-        print(f"Could not get author metadata ({e}). Keeping default.")
+            title = os.path.splitext(os.path.basename(epub_path))[0]
+            print(f"No title in metadata. Using filename: {title}")
 
-    items_processed = 0
-    spine_ids = [item[0] for item in book.spine] if book.spine else []
-    ordered_items = []
-    if spine_ids:
-        item_map = {item.id: item for item in book.get_items()}
-        for item_id in spine_ids:
-            if item_id in item_map and item_map[item_id].get_type() == ITEM_DOCUMENT:
-                ordered_items.append(item_map[item_id])
-        for item in book.get_items_of_type(ITEM_DOCUMENT):
-             if item.id not in spine_ids: ordered_items.append(item)
-        print(f"Processing {len(ordered_items)} items based on spine order.")
-    else:
-        ordered_items = list(book.get_items_of_type(ITEM_DOCUMENT))
-        print("Warning: EPUB spine information missing or empty. Processing items in default order.")
+        # Extract author
+        author_metadata = book.get_metadata('DC', 'creator')
+        if author_metadata:
+            # Assuming the first creator is the primary author
+            author = author_metadata[0][0]
+            print(f"Extracted author: {author}")
+        else:
+            author = "Unknown Author" # Default if no author found
+            print(f"No author in metadata. Using '{author}'.")
 
-    for item in ordered_items:
+    except Exception as e: # Catch potential errors during metadata extraction
+        print(f"Error extracting metadata: {e}")
+        if title is None: # Ensure title has a fallback
+            title = os.path.splitext(os.path.basename(epub_path))[0]
+            print(f"Using filename as title due to error: {title}")
+        if author is None: # Ensure author has a fallback
+            author = "Unknown Author"
+            print(f"Using '{author}' due to error in metadata extraction.")
+
+
+    # Iterate over the book's spine in reading order
+    for spine_item in book.spine:
+        item = book.get_item_with_id(spine_item[0])
+        if item and item.get_type() == ITEM_DOCUMENT:
             try:
                 soup = BeautifulSoup(item.get_content(), 'html.parser')
-                for script_or_style in soup(["script", "style", "head", "title"]): script_or_style.decompose()
-                paragraphs = soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'div'])
-                item_text_parts = []
-                for tag in paragraphs:
-                    text_part = tag.get_text(separator=' ', strip=True)
-                    text_part = re.sub(r'\s+', ' ', text_part).strip()
-                    if text_part: item_text_parts.append(text_part)
-                text = '\n\n'.join(item_text_parts)
-                text = re.sub(r'[ \t]{2,}', ' ', text)
-                text = re.sub(r'\n{3,}', '\n\n', text)
+                text = soup.get_text(separator=' ', strip=True)
                 if text:
                     text_content.append(text)
-                    items_processed += 1
             except Exception as e:
-                print(f"Warning: Error parsing item {item.get_id()} (Href: {item.get_name()}): {e}")
+                print(f"Error parsing document item {item.get_id()}: {e}")
 
-    if not text_content: raise ValueError(f"No text could be extracted from EPUB: {epub_path}")
-    full_text = '\n\n'.join(text_content)
-    print(f"Extracted {len(full_text)} chars from {items_processed} documents.")
-    return full_text, title, author
+    full_text = ' '.join(text_content)
 
-def convert_to_epub(input_path, output_dir):
-    """Convert an ebook to EPUB format using Calibre's ebook-convert."""
-    base_name = os.path.splitext(os.path.basename(input_path))[0]
-    sanitized_base = sanitize_filename(base_name)
-    output_path = os.path.join(output_dir, f"{sanitized_base}.epub")
-    ensure_directory(output_dir)
+    if not full_text:
+        raise ValueError("No text found in EPUB file.")
+
+    print(f"Extracted {len(full_text)} characters from EPUB.")
+    return full_text, title, author # Return author
+
+def convert_to_epub(input_path, output_path):
+    """Convert an ebook to EPUB format using Calibre."""
     try:
-        print(f"Converting '{input_path}' to EPUB '{output_path}'...")
-        command = ['ebook-convert', input_path, output_path, '--enable-heuristics', '--keep-ligatures', '--input-encoding=utf-8']
-        print(f"Running command: {' '.join(command)}")
-        result = subprocess.run(command, check=False, capture_output=True, text=True, encoding='utf-8', errors='ignore')
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            error_message = f"Output EPUB not found or empty after conversion. RC: {result.returncode}. Error: {result.stderr or result.stdout}"
-            print(error_message); raise RuntimeError(error_message)
-        if result.returncode != 0: print(f"Warning: ebook-convert finished with return code {result.returncode}, but output file exists. Stderr: {result.stderr}, Stdout: {result.stdout}")
-        print(f"Successfully converted to '{output_path}'.")
-        return output_path
-    except FileNotFoundError: raise RuntimeError(f"Error: 'ebook-convert' command not found. Is Calibre installed and in PATH?")
-    except Exception as e: raise RuntimeError(f"eBook conversion failed: {e}")
+        ensure_directory(os.path.dirname(output_path))
+        subprocess.run(['ebook-convert', input_path, output_path], check=True)
+        print(f"Converted {input_path} to EPUB.")
+        return True
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Error converting eBook: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error during conversion: {e}")
 
 def detect_file_type(file_path):
     """Detect the MIME type of a file."""
-    if not os.path.exists(file_path): raise FileNotFoundError(f"File not found: {file_path}")
     try:
-        mime_type = magic.Magic(mime=True).from_file(file_path)
-        if mime_type is None:
-             print(f"Warning: python-magic returned None for {file_path}. Attempting fallback detection.")
-             ext = os.path.splitext(file_path)[1].lower()
-             if ext == '.epub': return 'application/epub+zip'
-             if ext == '.mobi': return 'application/x-mobipocket-ebook'
-             if ext == '.pdf': return 'application/pdf'
-             if ext == '.txt': return 'text/plain'
-             if ext == '.html': return 'text/html'
-             if ext == '.azw3': return 'application/vnd.amazon.ebook'
-             if ext == '.fb2': return 'application/x-fictionbook+xml'
-             return None
-        return mime_type
+        mime = magic.Magic(mime=True)
+        return mime.from_file(file_path)
     except Exception as e:
-        print(f"Warning: Error detecting file type for {file_path}: {e}")
-        return None
+        raise RuntimeError(f"Error detecting file type: {e}")
 
 def ensure_directory(directory_path):
     """Ensure that a directory exists."""
-    if not directory_path: raise ValueError("Directory path cannot be empty.")
-    try: os.makedirs(directory_path, exist_ok=True)
-    except OSError as e: raise RuntimeError(f"Error creating directory '{directory_path}': {e}")
-    except Exception as e: raise RuntimeError(f"Unexpected error creating directory '{directory_path}': {e}")
+    try:
+        os.makedirs(directory_path, exist_ok=True)
+    except Exception as e:
+        raise RuntimeError(f"Error creating directory {directory_path}: {e}")
 
 def sanitize_filename(filename):
-    """Sanitize a filename by removing invalid characters and replacing spaces."""
-    if not filename: return "default_filename"
+    """Sanitize a filename by removing invalid characters."""
     sanitized = re.sub(r'[\\/*?:"<>|]', "", filename)
-    sanitized = re.sub(r'\s+', "_", sanitized)
-    sanitized = sanitized.strip('_ ')
-    return sanitized if sanitized else "sanitized_filename"
+    return sanitized.replace(" ", "_")
 
 def show_converted_audiobooks():
-    """List all converted audiobook files. Returns empty list if none found or on error."""
-    if not os.path.exists(OUTPUT_DIR): print(f"Output directory '{OUTPUT_DIR}' does not exist."); return []
-    try:
-        files = [os.path.join(OUTPUT_DIR, f) for f in os.listdir(OUTPUT_DIR) if f.lower().endswith('.mp3') and os.path.isfile(os.path.join(OUTPUT_DIR, f))]
-        if not files: print(f"No MP3 files found in '{OUTPUT_DIR}'."); return []
-        files.sort(key=os.path.getmtime, reverse=True)
-        return files
-    except Exception as e:
-        print(f"Error listing audiobooks in '{OUTPUT_DIR}': {e}")
-        return []
+    """List all converted audiobook files."""
+    output_dir = os.path.join("Working_files", "Book")
+    if not os.path.exists(output_dir):
+        return ["No audiobooks found."]
 
-def split_text_into_chunks(text, max_length=MAX_CHUNK_LENGTH):
-    """Splits text into chunks suitable for TTS, respecting sentence boundaries if possible."""
-    chunks = []
-    current_chunk = ""
-    print(f"Splitting text with max_length = {max_length}")
+    files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.endswith(('.mp3', '.m4b'))]
+    if not files:
+        return ["No audiobooks found."]
 
-    try:
-        tokenizer_path = 'tokenizers/punkt/english.pickle'
-        sent_tokenizer = nltk.data.load(tokenizer_path)
-        sentences = sent_tokenizer.tokenize(text)
-        print(f"NLTK tokenized into {len(sentences)} sentences.")
-    except Exception as e:
-        print(f"NLTK sentence tokenization failed: {e}. Falling back to paragraph/line split.")
-        sentences = [p.strip() for p in text.split('\n\n') if p.strip()]
-        if not sentences: sentences = [p.strip() for p in text.split('\n') if p.strip()]
-        if not sentences and len(text) > max_length:
-             print(f"Text has no clear paragraphs/lines. Using fixed-length split of {max_length} chars as final fallback.")
-             sentences = [text[i:i+max_length] for i in range(0, len(text), max_length)]
-        elif not sentences and text: sentences = [text]; print("Text is short and no splits found. Treating as single chunk.")
-        print(f"Split into {len(sentences)} segments using fallback method.")
-
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence: continue
-        if len(sentence) > max_length:
-            print(f"Warning: Sentence exceeds max_length ({len(sentence)} > {max_length}). Splitting mid-sentence.")
-            if current_chunk: chunks.append(current_chunk); current_chunk = ""
-            for i in range(0, len(sentence), max_length): chunks.append(sentence[i:i+max_length])
-        elif len(current_chunk) + len(sentence) + 1 <= max_length:
-            current_chunk += (" " + sentence) if current_chunk else sentence
-        else:
-            if current_chunk: chunks.append(current_chunk)
-            current_chunk = sentence
-    if current_chunk: chunks.append(current_chunk)
-    chunks = [c for c in chunks if c]
-
-    print(f"Split text into {len(chunks)} non-empty chunks.")
-    if chunks:
-        lengths = [len(c) for c in chunks]; print(f"Chunk lengths: Min={min(lengths)}, Max={max(lengths)}, Avg={sum(lengths)/len(lengths):.2f}")
-    return chunks
+    return files
 
 @gpu_decorator
-def infer_chunk(ref_audio_orig, ref_text, text_chunk, cross_fade_duration, speed, show_info):
-    """ Perform inference for a single text chunk. """
+def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, show_info=gr.Info, progress=gr.Progress(),
+          progress_start_fraction=0.0, progress_end_fraction=1.0, ebook_idx=0, num_ebooks=1): # Added ebook_idx, num_ebooks
+    """Perform inference to generate audio from text without truncation."""
     try:
-        effective_show_info = show_info if callable(show_info) else (lambda *args, **kwargs: None)
-        ref_audio, processed_ref_text = preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=effective_show_info)
-        if not ref_text and not processed_ref_text: raise RuntimeError("Automatic transcription of reference audio failed or produced empty text. Cannot proceed with TTS.")
-        elif not ref_text and processed_ref_text: print("Automatic transcription successful.")
+        ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=show_info)
     except Exception as e:
-        import traceback; print(f"Error during reference audio/text preprocessing: {e}\n{traceback.format_exc()}"); raise RuntimeError(f"Preprocessing failed: {e}")
-    if not text_chunk or text_chunk.isspace(): print("Skipping empty or whitespace-only text chunk."); return None
+        raise RuntimeError(f"Error in preprocessing reference audio and text: {e}")
+
+    if not gen_text.strip():
+        raise ValueError("Generated text is empty. Please provide valid text content.")
+
     try:
         with torch.no_grad():
             final_wave, final_sample_rate, _ = infer_process(
-                ref_audio, processed_ref_text, text_chunk, F5TTS_ema_model, vocoder,
-                cross_fade_duration=cross_fade_duration, speed=speed, show_info=effective_show_info,
+                ref_audio,
+                ref_text,
+                gen_text,
+                F5TTS_ema_model,
+                vocoder,
+                cross_fade_duration=cross_fade_duration,
+                speed=speed,
+                show_info=show_info,
+                progress=progress,
+                progress_start_fraction=progress_start_fraction,
+                progress_end_fraction=progress_end_fraction,
+                ebook_idx=ebook_idx,        # Pass down
+                num_ebooks=num_ebooks       # Pass down
             )
-        if final_wave is None or final_sample_rate is None: print("Warning: TTS inference returned None for wave or sample rate."); return None
-        if isinstance(final_wave, torch.Tensor) and final_wave.numel() == 0: print("Warning: TTS inference returned an empty tensor."); return None
-        if isinstance(final_wave, np.ndarray) and final_wave.size == 0: print("Warning: TTS inference returned an empty numpy array."); return None
-        print(f"Generated chunk: {len(final_wave) if hasattr(final_wave, '__len__') else 'N/A'} samples @ {final_sample_rate} Hz.")
-        return (final_sample_rate, final_wave)
     except Exception as e:
-        import traceback; print(f"Error during TTS inference (infer_process): {e}\n{traceback.format_exc()}"); return None
+        raise RuntimeError(f"Error during inference process: {e}")
 
-# --- Main Processing Logic ---
+    print(f"Generated audio length: {len(final_wave)} samples at {final_sample_rate} Hz.")
+    return (final_sample_rate, final_wave), ref_text
 
-def process_ebook_to_audio(ref_audio_input, ref_text_input, ebook_path, cross_fade_duration, speed, max_chunk_length, mp3_bitrate, progress=gr.Progress(track_tqdm=True)):
-    """Processes a single eBook to an audiobook using chunking."""
-    temp_dir = None; temp_chunk_files = []; final_mp3_path = None; converted_epub_path = None; extracted_cover_path = None
-    sample_rate = 24000; ebook_title = "Untitled"; ebook_author = "Unknown Author"
+@gpu_decorator
+def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_duration, speed, progress=gr.Progress()):
     try:
-        if not ebook_path or not os.path.exists(ebook_path): yield None, f"Error: Input file not found or path is invalid: {ebook_path}"; return
-        progress(0, desc=f"Starting: {os.path.basename(ebook_path)}"); original_input_path = ebook_path
-        file_type = detect_file_type(ebook_path); print(f"Detected file type: {file_type}")
-        if file_type != 'application/epub+zip':
-            progress(0.05, desc="Converting to EPUB...")
-            try: converted_epub_path = convert_to_epub(ebook_path, TEMP_CONVERT_DIR); epub_path_to_process = converted_epub_path; print(f"Using converted EPUB: {epub_path_to_process}")
-            except Exception as e: yield None, f"Error: Conversion to EPUB failed: {e}"; return
-        else: epub_path_to_process = ebook_path; print("Input is already EPUB. No conversion needed.")
-        progress(0.1, desc="Extracting text/metadata...")
-        try:
-            gen_text, ebook_title, ebook_author = extract_text_title_author_from_epub(epub_path_to_process)
-            extracted_cover_path = extract_metadata_and_cover(epub_path_to_process)
-            print(f"Extracted Title: '{ebook_title}', Author: '{ebook_author}'")
-            print(f"Cover path: {extracted_cover_path}" if extracted_cover_path else "No cover found or extracted.")
-        except ValueError as ve: yield None, f"Error: Failed to extract text content: {ve}"; return
-        except Exception as e: import traceback; yield None, f"Error: Failed to extract content/metadata: {e}\n{traceback.format_exc()}"; return
-        ref_text = ref_text_input; print("Using provided reference text." if ref_text else "Reference text is empty. Automatic transcription will be attempted.")
-        sanitized_title = sanitize_filename(ebook_title); sanitized_author = sanitize_filename(ebook_author)
-        if not sanitized_title: sanitized_title = f"audiobook_{os.path.splitext(os.path.basename(original_input_path))[0]}"
-        base_filename = f"{sanitized_title}_by_{sanitized_author}" if sanitized_author and sanitized_author.lower() != "unknown_author" else sanitized_title
-        final_mp3_path = os.path.join(OUTPUT_DIR, f"{base_filename}.mp3"); ensure_directory(os.path.dirname(final_mp3_path)); print(f"Planned output path: {final_mp3_path}")
-        progress(0.2, desc="Splitting text..."); text_chunks = split_text_into_chunks(gen_text, max_length=max_chunk_length)
-        total_chunks = len(text_chunks);
-        if total_chunks == 0: yield None, "Error: Text splitting resulted in zero chunks."; return
-        temp_dir = tempfile.mkdtemp(prefix="audio_chunks_"); print(f"Temporary directory for audio chunks: {temp_dir}")
-        successful_chunks = 0; first_chunk_processed = False; dummy_show_info = lambda *args, **kwargs: None
-        for i, chunk in enumerate(text_chunks):
-            chunk_start_progress = 0.25 + (i / total_chunks) * 0.5; progress(chunk_start_progress, desc=f"Generating audio: Chunk {i+1}/{total_chunks}")
-            print(f"\nProcessing Chunk {i+1}/{total_chunks} (Length: {len(chunk)})")
-            clean_chunk = chunk.strip(); clean_chunk = re.sub(r'\s+', ' ', clean_chunk)
-            if not clean_chunk: print("Skipping empty or whitespace-only chunk."); continue
-            audio_out_chunk_data = None
-            try: audio_out_chunk_data = infer_chunk(ref_audio_input, ref_text, clean_chunk, cross_fade_duration, speed, show_info=dummy_show_info)
-            except RuntimeError as infer_err: print(f"Chunk {i+1} Error (from infer_chunk): {infer_err}")
-            except Exception as generic_infer_err: print(f"Chunk {i+1} Unexpected Error during inference call: {generic_infer_err}")
-            if audio_out_chunk_data:
-                chunk_sample_rate, wave = audio_out_chunk_data
-                if wave is not None and chunk_sample_rate is not None and hasattr(wave, 'size') and wave.size > 0:
-                    chunk_filename = os.path.join(temp_dir, f"chunk_{i:05d}.wav")
-                    try:
-                        if isinstance(wave, torch.Tensor): wave = wave.squeeze().cpu().numpy()
-                        if wave.ndim > 1: wave = np.mean(wave, axis=1)
-                        if wave.dtype!=np.float32 and wave.dtype!=np.int16: wave = wave.astype(np.float32) if np.issubdtype(wave.dtype, np.floating) and np.max(np.abs(wave))<=1.0 else wave.astype(np.int16) if np.issubdtype(wave.dtype, np.integer) else wave.astype(np.float32)
-                        if not first_chunk_processed: sample_rate = chunk_sample_rate; print(f"Audio sample rate set to {sample_rate} Hz (from first chunk)."); first_chunk_processed = True
-                        elif chunk_sample_rate != sample_rate: print(f"Warning: Sample rate mismatch! Chunk {i+1} has SR={chunk_sample_rate}, expected {sample_rate}.")
-                        sf.write(chunk_filename, wave, chunk_sample_rate); temp_chunk_files.append(chunk_filename); successful_chunks += 1; print(f"Saved chunk {i+1} to {chunk_filename}")
-                    except Exception as e: print(f"Error saving chunk {i+1} WAV: {e}")
-                else: print(f"Warning: Inference for chunk {i+1} produced invalid or empty audio data.")
-            else: print(f"Warning: Inference failed or was skipped for chunk {i+1}.")
-            del audio_out_chunk_data, wave; gc.collect();
-            if device == torch.device("cuda"): torch.cuda.empty_cache()
-        if not temp_chunk_files: yield None, "Error: No audio chunks were successfully generated."; return
-        print(f"\nFinished generating audio chunks. Successful: {successful_chunks}/{total_chunks}.")
-        progress(0.8, desc="Stitching audio..."); print(f"Concatenating audio chunks using ffmpeg (Bitrate: {mp3_bitrate})...")
-        list_file_path = os.path.join(temp_dir, "mylist.txt")
-        try:
-            with open(list_file_path, 'w', encoding='utf-8') as f:
-                for chunk_file_path in temp_chunk_files: escaped_path = chunk_file_path.replace("'", "'\\''"); normalized_path = escaped_path.replace(os.sep, '/'); f.write(f"file '{normalized_path}'\n")
-            print(f"Generated ffmpeg file list: {list_file_path}")
-        except Exception as e: yield None, f"Error creating ffmpeg file list: {e}"; return
-        ffmpeg_cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_file_path, '-vn', '-c:a', 'libmp3lame', '-b:a', str(mp3_bitrate), '-ar', str(sample_rate), '-ac', '1', final_mp3_path]
-        print(f"Running ffmpeg command: {' '.join(ffmpeg_cmd)}")
-        try:
-            proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=False, encoding='utf-8', errors='ignore')
-            if proc.returncode != 0: error_message = f"ffmpeg concatenation error (RC={proc.returncode}):\n{proc.stderr or proc.stdout}"; print(error_message); yield None, error_message; return
-            else: print("ffmpeg concatenation successful.")
-        except FileNotFoundError: yield None, "Error: 'ffmpeg' command not found. Is ffmpeg installed and in PATH?"; return
-        except Exception as e: yield None, f"Error running ffmpeg: {e}"; return
-        progress(0.95, desc="Adding metadata...");
-        if os.path.exists(final_mp3_path): embed_metadata_into_mp3(final_mp3_path, extracted_cover_path, ebook_title, ebook_author)
-        else: print(f"Warning: Final MP3 file '{final_mp3_path}' not found after ffmpeg process. Skipping metadata embedding.")
-        progress(1, desc=f"Completed: {os.path.basename(final_mp3_path)}"); print(f"Successfully created audiobook: {final_mp3_path}"); yield final_mp3_path, None
-    except Exception as e: import traceback; error_msg = f"Unexpected error processing {os.path.basename(ebook_path)}: {e}\n{traceback.format_exc()}"; print(f"Fatal Error: {error_msg}"); yield None, error_msg
-    finally:
-        print("Cleaning up temporary files...");
-        if temp_dir and os.path.exists(temp_dir):
-            try: shutil.rmtree(temp_dir); print(f"Removed temp dir: {temp_dir}")
-            except Exception as e: print(f"Warn: Could not remove temp dir {temp_dir}: {e}")
-        if converted_epub_path and os.path.exists(converted_epub_path):
-            try: os.remove(converted_epub_path); print(f"Removed temp EPUB: {converted_epub_path}")
-            except Exception as e: print(f"Warn: Could not remove temp EPUB {converted_epub_path}: {e}")
-        if extracted_cover_path and os.path.exists(extracted_cover_path) and TEMP_CONVERT_DIR in extracted_cover_path:
-            try: os.remove(extracted_cover_path); print(f"Removed temp cover: {extracted_cover_path}")
-            except Exception as e: print(f"Warn: Could not remove temp cover {extracted_cover_path}: {e}")
-        gc.collect();
-        if device == torch.device("cuda"): torch.cuda.empty_cache(); print("Cleanup finished.")
+        processed_audiobooks = []
+        num_ebooks = len(gen_file_input)
 
-def batch_process_ebooks(ref_audio_input, ref_text_input, gen_file_inputs, cross_fade_duration, speed, max_chunk_length, mp3_bitrate, progress=gr.Progress(track_tqdm=True)):
-    """Handles batch processing of eBooks for Gradio, yielding results."""
-    if not gen_file_inputs: gr.Warning("No eBook files provided."); yield None, show_converted_audiobooks(); return
-    if not ref_audio_input and not ref_text_input: gr.Error("Reference Audio required if Reference Text not provided."); yield None, show_converted_audiobooks(); return
-    elif not ref_audio_input and ref_text_input: print("Proceeding with reference text only."); gr.Warning("Reference Audio missing. TTS may be suboptimal.")
-    processed_paths = []; last_successful_output_path = None; errors = []; ebook_paths = []
-    if isinstance(gen_file_inputs, list): ebook_paths = [f.name for f in gen_file_inputs if hasattr(f, 'name') and f.name]
-    elif hasattr(gen_file_inputs, 'name') and gen_file_inputs.name: ebook_paths = [gen_file_inputs.name]
-    if not ebook_paths: gr.Warning("No valid eBook file paths found."); yield None, show_converted_audiobooks(); return
-    num_ebooks = len(ebook_paths); print(f"Starting batch processing for {num_ebooks} eBook(s)..."); print(f"Settings: Speed={speed}, CrossFade={cross_fade_duration}, ChunkLen={max_chunk_length}, Bitrate={mp3_bitrate}")
-    for idx, ebook_path in enumerate(ebook_paths):
-        print(f"\n--- Processing eBook {idx+1}/{num_ebooks}: {os.path.basename(ebook_path)} ---")
-        try:
-            ebook_processor_gen = process_ebook_to_audio(ref_audio_input, ref_text_input, ebook_path, cross_fade_duration, speed, int(max_chunk_length), mp3_bitrate, progress)
-            final_path, error_msg = next(ebook_processor_gen)
-            if error_msg: error_details = f"'{os.path.basename(ebook_path)}': Failed - {error_msg}"; print(f"ERROR: {error_details}"); errors.append(error_details); yield last_successful_output_path, show_converted_audiobooks()
-            elif final_path and os.path.exists(final_path): success_message = f"'{os.path.basename(ebook_path)}': OK -> '{os.path.basename(final_path)}'"; print(f"SUCCESS: {success_message}"); processed_paths.append(final_path); last_successful_output_path = final_path; yield last_successful_output_path, show_converted_audiobooks()
-            else: unknown_error = f"'{os.path.basename(ebook_path)}': Finished, but no output file generated."; print(f"WARNING: {unknown_error}"); errors.append(unknown_error); yield last_successful_output_path, show_converted_audiobooks()
-        except StopIteration: stop_iter_warn = f"'{os.path.basename(ebook_path)}': Processing generator finished unexpectedly."; print(f"WARNING: {stop_iter_warn}"); errors.append(stop_iter_warn); yield last_successful_output_path, show_converted_audiobooks()
-        except Exception as e: import traceback; batch_loop_error = f"Batch loop error for '{os.path.basename(ebook_path)}': {e}\n{traceback.format_exc()}"; print(f"ERROR: {batch_loop_error}"); errors.append(f"'{os.path.basename(ebook_path)}': Critical batch error - {e}"); yield last_successful_output_path, show_converted_audiobooks()
-    print("\n--- Batch Processing Complete ---"); final_audiobook_list = show_converted_audiobooks()
-    if errors: error_summary = "Batch processing finished with errors:\n" + "\n".join(errors); gr.Warning(error_summary); print("\nSummary of Errors:"); [print(f"- {e}") for e in errors]
-    print(f"\nSuccessful conversions: {len(processed_paths)}, Errors/warnings: {len(errors)}")
-    yield last_successful_output_path, final_audiobook_list
+        # Define relative durations (fractions) for stages within ONE ebook's processing cycle.
+        # These should sum to 1.0 for one ebook.
+        ebook_frac = {
+            "init_detect_convert": 0.005,  # 2% for initial setup, detection, and potential conversion
+            "extract_text":        0.005,  # 2% for text extraction
+            "infer":               0.89,  # 86% for the main TTS inference (bulk of the time)
+            "stitch":              0.03,  # 3% for audio stitching
+            "mp3_meta":            0.07,  # 7% for MP3 conversion and metadata embedding
+            # Total: 0.02 + 0.02 + 0.86 + 0.03 + 0.07 = 1.00
+        }
 
-# --- Gradio App Definition ---
+        for idx, ebook_file_data in enumerate(gen_file_input):
+            current_ebook_base_progress = idx / float(num_ebooks)
+            
+            # This variable will track the progress offset *within the current ebook's allocated slot*
+            # It represents how much of the current ebook's 1/num_ebooks fraction is completed by prior stages.
+            progress_offset_within_ebook = 0.0
 
-DEFAULT_REF_AUDIO_PATH = "/app/default_voice.mp3"
+            original_ebook_path = ebook_file_data.name
+            if not os.path.exists(original_ebook_path):
+                progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (File Not Found: {os.path.basename(original_ebook_path)})")
+                continue 
+
+            epub_path_for_extraction = original_ebook_path
+            temp_epub_created = False
+
+            # --- Stage: File detection and conversion ---
+            desc_suffix = "Detecting file type..."
+            # Show progress at the very start of this stage for this ebook
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
+                     desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
+            
+            file_type = detect_file_type(original_ebook_path)
+            if file_type != 'application/epub+zip':
+                desc_suffix = "Converting to EPUB..."
+                progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
+                         desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
+                sanitized_base = sanitize_filename(os.path.splitext(os.path.basename(original_ebook_path))[0])
+                temp_epub_dir = os.path.join("Working_files", "temp_converted")
+                ensure_directory(temp_epub_dir)
+                temp_epub = os.path.join(temp_epub_dir, f"{sanitized_base}.epub")
+                try:
+                    convert_to_epub(original_ebook_path, temp_epub)
+                    epub_path_for_extraction = temp_epub
+                    temp_epub_created = True
+                except Exception as e:
+                    print(f"Error converting {original_ebook_path} to EPUB: {e}. Skipping.")
+                    progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (Conversion Error)")
+                    continue 
+            
+            # Update progress offset after this stage
+            progress_offset_within_ebook += ebook_frac["init_detect_convert"]
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
+                     desc=f"Ebook {idx+1}/{num_ebooks}: File prepped.")
+
+            # --- Stage: Extracting text ---
+            desc_suffix = "Extracting text..."
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
+                     desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
+            
+            try:
+                gen_text, ebook_title, ebook_author = extract_text_and_title_from_epub(epub_path_for_extraction)
+                cover_image = extract_metadata_and_cover(epub_path_for_extraction) 
+            except Exception as e:
+                print(f"Error extracting text/metadata from {epub_path_for_extraction}: {e}. Skipping.")
+                progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (Text Extraction Error)")
+                if temp_epub_created and os.path.exists(epub_path_for_extraction): os.remove(epub_path_for_extraction)
+                continue
+
+            ref_text = ref_text_input or ""
+            
+            # Update progress offset after this stage
+            progress_offset_within_ebook += ebook_frac["extract_text"]
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
+                     desc=f"Ebook {idx+1}/{num_ebooks}: Text extracted.")
+
+            # --- Stage: Inference ---
+            # `overall_infer_start_frac` is the progress point where inference begins.
+            # It's the base progress for this ebook + what's consumed by prior stages within this ebook's slot.
+            overall_infer_start_frac = current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks)
+            
+            # `overall_infer_end_frac` is where inference is expected to end.
+            overall_infer_end_frac = overall_infer_start_frac + (ebook_frac["infer"] / num_ebooks)
+            
+            # This message appears just before calling infer().
+            # The `utils_infer.py` will then immediately show its "0.0%" message for chunk processing.
+            progress(overall_infer_start_frac, desc=f"Ebook {idx+1}/{num_ebooks}: Preparing audio synthesis...")
+
+            try:
+                audio_out, _ = infer(
+                    ref_audio_input,
+                    ref_text,
+                    gen_text,
+                    cross_fade_duration,
+                    speed,
+                    show_info=gr.Info,
+                    progress=progress,
+                    ebook_idx=idx,
+                    num_ebooks=num_ebooks,
+                    progress_start_fraction=overall_infer_start_frac, # Pass the calculated start
+                    progress_end_fraction=overall_infer_end_frac     # Pass the calculated end
+                )
+            except Exception as e:
+                print(f"Error during TTS inference for {ebook_title}: {e}. Skipping.")
+                progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (Inference Error)")
+                if temp_epub_created and os.path.exists(epub_path_for_extraction): os.remove(epub_path_for_extraction)
+                if cover_image and os.path.exists(cover_image): os.remove(cover_image)
+                continue
+            
+            # Update progress offset after inference.
+            # The `infer` function itself will drive progress between overall_infer_start_frac and overall_infer_end_frac.
+            # So, after it finishes, progress_offset_within_ebook should be at the end of inference's allocation.
+            progress_offset_within_ebook += ebook_frac["infer"]
+            # progress() call here is implicitly handled by the end of the infer() function.
+
+            # --- Stage: Stitching ---
+            desc_suffix = "Stitching audio..."
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
+                     desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
+            
+            sample_rate, wave = audio_out
+            if not wave.any(): # Check if wave is empty
+                print(f"Warning: Generated audio wave is empty for {ebook_title}. Skipping.")
+                progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (Empty Audio)")
+                if temp_epub_created and os.path.exists(epub_path_for_extraction): os.remove(epub_path_for_extraction)
+                if cover_image and os.path.exists(cover_image): os.remove(cover_image)
+                continue
+
+            temp_audio_dir = os.path.join("Working_files", "temp_audio")
+            ensure_directory(temp_audio_dir)
+            tmp_wav_path = "" # Initialize
+            try:
+                with tempfile.NamedTemporaryFile(dir=temp_audio_dir, delete=False, suffix=".wav") as tmp_wav:
+                    sf.write(tmp_wav.name, wave, sample_rate)
+                    tmp_wav_path = tmp_wav.name
+            except Exception as e:
+                print(f"Error writing temporary WAV for {ebook_title}: {e}. Skipping.")
+                progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (WAV Error)")
+                if temp_epub_created and os.path.exists(epub_path_for_extraction): os.remove(epub_path_for_extraction)
+                if cover_image and os.path.exists(cover_image): os.remove(cover_image)
+                continue
+            
+            # Update progress offset
+            progress_offset_within_ebook += ebook_frac["stitch"]
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
+                     desc=f"Ebook {idx+1}/{num_ebooks}: Audio stitched.")
+
+            # --- Stage: MP3 Conversion & Metadata ---
+            desc_suffix = "Converting to MP3 & adding metadata..."
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
+                     desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
+
+            sanitized_title = sanitize_filename(ebook_title) or f"audiobook_{idx}"
+            final_mp3_dir = os.path.join("Working_files", "Book")
+            ensure_directory(final_mp3_dir)
+            tmp_mp3_path = os.path.join(final_mp3_dir, f"{sanitized_title}.mp3")
+
+            try:
+                audio = AudioSegment.from_wav(tmp_wav_path)
+                audio.export(tmp_mp3_path, format="mp3", bitrate="320k", parameters=["-q:a", "0"]) # Consider "192k" for smaller files
+                embed_metadata_into_mp3(tmp_mp3_path, cover_image, ebook_title, ebook_author, album_title=ebook_title)
+            except Exception as e:
+                print(f"Error during MP3 conversion/metadata for {ebook_title}: {e}. Skipping.")
+                progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (MP3/Meta Error)")
+                if os.path.exists(tmp_wav_path): os.remove(tmp_wav_path)
+                if temp_epub_created and os.path.exists(epub_path_for_extraction): os.remove(epub_path_for_extraction)
+                if cover_image and os.path.exists(cover_image): os.remove(cover_image)
+                continue
+
+            # Update progress offset
+            progress_offset_within_ebook += ebook_frac["mp3_meta"]
+            # Final progress update for this ebook should reach the end of its allocated slot
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
+                     desc=f"Ebook {idx+1}/{num_ebooks}: MP3 created.")
+
+            # Cleanup
+            if os.path.exists(tmp_wav_path):
+                try: os.remove(tmp_wav_path)
+                except OSError as e: print(f"Error removing temp WAV {tmp_wav_path}: {e}")
+            if cover_image and os.path.exists(cover_image):
+                try: os.remove(cover_image)
+                except OSError as e: print(f"Error removing temp cover {cover_image}: {e}")
+            if temp_epub_created and os.path.exists(epub_path_for_extraction):
+                try: os.remove(epub_path_for_extraction)
+                except OSError as e: print(f"Error removing temp EPUB {epub_path_for_extraction}: {e}")
+
+            processed_audiobooks.append(tmp_mp3_path)
+            # Ensure progress reaches the end for this ebook; progress_offset_within_ebook should be ~1.0 here.
+            # If ebook_frac sums to 1.0, then current_ebook_base_progress + (1.0 / num_ebooks) is (idx+1)/num_ebooks
+            final_ebook_progress = (idx + 1) / float(num_ebooks)
+            progress(final_ebook_progress, desc=f"Ebook {idx+1}/{num_ebooks}: Completed.")
+            yield tmp_mp3_path, processed_audiobooks
+        
+        # Final progress update if all ebooks processed successfully
+        if num_ebooks > 0 and not processed_audiobooks and idx == num_ebooks -1 : # All skipped
+             progress(1.0, desc="All eBooks skipped or failed processing.")
+        elif processed_audiobooks : # At least one processed
+             progress(1.0, desc=f"All {num_ebooks} eBook(s) processing finished.")
+
+
+    except Exception as e:
+        print(f"An error occurred in basic_tts: {e}")
+        import traceback
+        traceback.print_exc()
+        if progress and hasattr(progress, '__call__'): 
+            try:
+                progress_val_on_error = 0.0
+                if 'idx' in locals() and 'num_ebooks' in locals() and num_ebooks > 0:
+                     progress_val_on_error = (idx / float(num_ebooks)) 
+                current_progress_desc = f"Error processing"
+                if 'idx' in locals() and 'num_ebooks' in locals():
+                    current_progress_desc = f"Ebook {idx+1}/{num_ebooks}: Error"
+                progress(progress_val_on_error, desc=f"{current_progress_desc} - {str(e)[:100]}. Check logs.") # Truncate error
+            except Exception as pe: 
+                print(f"Error updating progress during exception handling: {pe}")
+        raise gr.Error(f"An error occurred: {str(e)}")
+
+DEFAULT_REF_AUDIO_PATH = "/app/default_voice.mp3" 
 DEFAULT_REF_TEXT = "For thirty-six years I was the confidential secretary of the Roman statesman Cicero. At first this was exciting, then astonishing, then arduous, and finally extremely dangerous."
 
-def clear_ref_text_on_audio_change(audio_filepath):
-    if audio_filepath and os.path.exists(audio_filepath): print(f"Ref audio changed ({os.path.basename(audio_filepath)}). Clearing ref text."); return ""
-    else: print("Ref audio cleared. Ref text cleared."); return ""
 
-# <<< UPDATED create_gradio_app with button moved >>>
 def create_gradio_app():
     """Create and configure the Gradio application."""
-    try: theme = gr.themes.Soft(); print("Soft theme loaded.")
-    except AttributeError: print("Warning: Soft theme not found, using Default."); theme = gr.themes.Default()
-    default_audio_exists = os.path.exists(DEFAULT_REF_AUDIO_PATH)
-    if not default_audio_exists: print(f"Warning: Default ref audio not found: {DEFAULT_REF_AUDIO_PATH}")
-    available_bitrates = ["128k", "192k", "256k", "320k"]; default_bitrate = "320k"; default_chunk_length = MAX_CHUNK_LENGTH
+    with gr.Blocks(theme=gr.themes.Ocean()) as app: # Use gr.themes.Ocean if available, else None
+        gr.Markdown("# eBook to Audiobook with F5-TTS!")
 
-    with gr.Blocks(theme=theme, title="eBook-to-Audiobook") as app:
-        gr.Markdown("# 📚➡️🎧 eBook to Audiobook Converter (F5-TTS)")
-        gr.Markdown("Upload eBooks and a voice sample (<15s) to generate an audiobook.")
-
-        with gr.Row():
-            # --- Left Column: Inputs & Settings ---
-            with gr.Column(scale=1, min_width=350):
-                gr.Markdown("## 1. Provide Reference Voice")
-                ref_audio_input = gr.Audio(label="Upload Voice Sample (<15s) or Record", sources=["upload", "microphone"], type="filepath", value=DEFAULT_REF_AUDIO_PATH if default_audio_exists else None)
-                gr.Markdown("## 2. Upload eBooks")
-                gen_file_input = gr.Files(label="Upload eBook File(s)", file_types=['.epub', '.mobi', '.pdf', '.txt', '.html', '.azw3', '.fb2'], file_count="multiple")
-                gr.Markdown("## 3. Configure Settings")
-                ref_text_input = gr.Textbox(label="Reference Text (Optional - Leave Blank for Auto-Transcription)", lines=3, placeholder="Enter EXACT transcript or leave blank...", value=DEFAULT_REF_TEXT if default_audio_exists else "")
-                speed_slider = gr.Slider(label="Speech Speed", minimum=0.5, maximum=2.0, value=1.0, step=0.05)
-                cross_fade_duration_slider = gr.Slider(label="Chunk Cross-Fade (Seconds)", minimum=0.0, maximum=0.5, value=0.0, step=0.01)
-                max_chunk_length_input = gr.Slider(label="Max Text Chunk Length (Characters)", minimum=100, maximum=1500, value=default_chunk_length, step=50)
-                mp3_bitrate_input = gr.Dropdown(label="Output MP3 Bitrate (Quality)", choices=available_bitrates, value=default_bitrate, interactive=True)
-                # --- Generate button is NOT defined here anymore ---
-
-            # --- Right Column: Outputs & Actions ---
-            with gr.Column(scale=2, min_width=400):
-                gr.Markdown("## 4. Play & Download")
-                player = gr.Audio(label="Listen to the Latest Audiobook", interactive=False)
-                audiobooks_output = gr.Files(label="Completed Audiobooks (Download Links)", interactive=False, file_count="multiple")
-                show_audiobooks_btn = gr.Button("Refresh Audiobook List", variant="secondary")
-                # <<< Generate Button moved here, below Refresh button >>>
-                generate_btn = gr.Button("Generate Audiobook(s)", variant="primary", scale=2) # scale might need adjustment here
-
-        # --- Event Listeners ---
-        ref_audio_input.change(fn=clear_ref_text_on_audio_change, inputs=[ref_audio_input], outputs=[ref_text_input], queue=False)
-        generate_btn.click(
-            fn=batch_process_ebooks,
-            inputs=[ref_audio_input, ref_text_input, gen_file_input, cross_fade_duration_slider, speed_slider, max_chunk_length_input, mp3_bitrate_input],
-            outputs=[player, audiobooks_output],
+        ref_audio_input = gr.Audio(
+            label="Upload Voice File (<15 sec) or Record with Mic Icon (Ensure Natural Phrasing, Trim Silence)",
+            type="filepath",
+            value=DEFAULT_REF_AUDIO_PATH
         )
-        show_audiobooks_btn.click(fn=show_converted_audiobooks, inputs=[], outputs=[audiobooks_output], queue=False)
-        app.load(fn=show_converted_audiobooks, inputs=None, outputs=[audiobooks_output], queue=False)
+
+        gen_file_input = gr.Files(
+            label="Upload eBook or Multiple for Batch Processing (epub, mobi, pdf, txt, html)",
+            file_types=[".epub", ".mobi", ".pdf", ".txt", ".html"],
+            # Assuming 'filepath' was intended here based on previous context,
+            # but if it's causing issues or not what you want, adjust as needed.
+            # Gradio's gr.Files often works with a list of file paths or temp files.
+            # type="filepath", # This might be redundant if file_count="multiple" handles it
+            file_count="multiple",
+        )
+
+        # Buttons are now stacked vertically. full_width removed for compatibility.
+        generate_btn = gr.Button("Start", variant="primary")
+        show_audiobooks_btn = gr.Button("Show All Completed Audiobooks", variant="secondary")
+
+        audiobooks_output = gr.Files(label="Converted Audiobooks (Download Links)")
+        player = gr.Audio(label="Play Latest Converted Audiobook", interactive=False)
+
+        with gr.Accordion("Advanced Settings", open=False):
+            ref_text_input = gr.Textbox(
+                label="Reference Text (Leave Blank for Automatic Transcription)",
+                lines=2,
+                value=DEFAULT_REF_TEXT
+            )
+            speed_slider = gr.Slider(
+                label="Speech Speed (Adjusting Can Cause Artifacts)",
+                minimum=0.3,
+                maximum=2.0,
+                value=1.0,
+                step=0.1,
+            )
+            cross_fade_duration_slider = gr.Slider(
+                label="Cross-Fade Duration (Between Generated Audio Chunks)",
+                minimum=0.0,
+                maximum=1.0,
+                value=0.0,
+                step=0.01,
+            )
+
+        generate_btn.click(
+            basic_tts,
+            inputs=[
+                ref_audio_input,
+                ref_text_input,
+                gen_file_input,
+                cross_fade_duration_slider,
+                speed_slider,
+            ],
+            outputs=[player, audiobooks_output],
+            
+        )
+
+        show_audiobooks_btn.click(
+            show_converted_audiobooks,
+            inputs=[],
+            outputs=[audiobooks_output],
+        )
 
     return app
 
-# --- Main Execution ---
-
 @click.command()
-@click.option("--port", "-p", default=7860, type=int, help="Port number.")
-@click.option("--host", "-H", default="0.0.0.0", help="Host address (0.0.0.0 for Docker).")
-@click.option("--share", "-s", default=False, is_flag=True, help="Share via Gradio link.")
-@click.option("--debug", default=False, is_flag=True, help="Gradio debug mode.")
-def main(port, host, share, debug):
+@click.option("--port", "-p", default=None, type=int, help="Port to run the app on")
+@click.option("--host", "-H", default=None, help="Host to run the app on")
+@click.option(
+    "--share",
+    "-s",
+    default=False,
+    is_flag=True,
+    help="Share the app via Gradio share link",
+)
+@click.option("--api", "-a", default=True, is_flag=True, help="Allow API access")
+def main(port, host, share, api):
     """Main entry point to launch the Gradio app."""
-    print("--- Pre-run Checks ---")
-    if not os.path.exists(DEFAULT_REF_AUDIO_PATH): print(f"WARN: Default ref audio missing: {DEFAULT_REF_AUDIO_PATH}")
-    else: print(f"Default ref audio found: '{DEFAULT_REF_AUDIO_PATH}'")
-    try: result=subprocess.run(['ffmpeg','-version'],check=True,capture_output=True,text=True); print(f"ffmpeg found. ({result.stdout.splitlines()[0]})")
-    except Exception as e: print(f"ERROR: ffmpeg check failed: {e}. Audio stitching will likely fail.")
-    try: calibre_path="/root/calibre/ebook-convert"; cmd=[calibre_path if os.path.exists(calibre_path) else 'ebook-convert', '--version']; result=subprocess.run(cmd,check=True,capture_output=True,text=True); print(f"ebook-convert found. ({result.stdout.strip()})")
-    except Exception as e: print(f"ERROR: ebook-convert check failed: {e}. Conversion for non-EPUB formats will fail.")
-    try: nltk.data.find('tokenizers/punkt'); print("NLTK 'punkt' data found.")
-    except LookupError: print("WARN: NLTK 'punkt' data not found. Sentence splitting may be less accurate.")
-    print("--- End Pre-run Checks ---")
     app = create_gradio_app()
-    print(f"\nStarting Gradio app on http://{host}:{port}")
-    if share: print("Gradio share link will be created.")
-    if debug: print("Gradio debug mode enabled.")
-    try: gradio_version = pkg_resources.get_distribution("gradio").version; print(f"Gradio Version: {gradio_version}")
-    except Exception: print("Could not determine Gradio version.")
-    app.queue().launch( server_name=host, server_port=port, share=share, debug=debug )
+    print("Starting app...")
+    app.queue().launch(
+        server_name="0.0.0.0",
+        server_port=port or 7860,
+        share=share,
+        show_api=api,
+        debug=True
+    )
 
 if __name__ == "__main__":
     import sys
-    print("--- System/Library Information ---")
-    print("Python Version:", sys.version.split('\n')[0])
-    try: print("Torch Version:", torch.__version__)
-    except Exception: print("Torch not found.")
-    try: print("Torchaudio Version:", torchaudio.__version__)
-    except Exception: print("Torchaudio not found.")
-    try: print("Transformers Version:", pkg_resources.get_distribution("transformers").version)
-    except Exception: print("Transformers not found.")
-    try: print("NLTK Version:", nltk.__version__)
-    except Exception: print("NLTK not found.")
-    try: print("Gradio Version:", pkg_resources.get_distribution("gradio").version)
-    except Exception: print("Gradio not found.")
-    print(f"Using device: {device}")
-    print("---------------------------------")
-    if not USING_SPACES: main()
-    else: print("Launching Gradio app in Spaces mode..."); app = create_gradio_app(); app.queue().launch(debug=True)
+    print("Arguments passed to Python:", sys.argv)
+    if not USING_SPACES:
+        main()
+    else:
+        app = create_gradio_app()
+        app.queue().launch(debug=True)
