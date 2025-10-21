@@ -1,8 +1,10 @@
 import os
 import re
+import gc
 import tempfile
 import subprocess
 import csv
+import time
 from collections import OrderedDict
 from importlib.resources import files
 
@@ -30,7 +32,7 @@ from f5_tts.infer.utils_infer import (
     infer_process,
 )
 
-import torch  # Added missing import
+import torch
 
 # Determine the available device (GPU or CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -53,6 +55,74 @@ def gpu_decorator(func):
         return spaces.GPU(func)
     return func
 
+class EbookProgressUpdater:
+    """
+    A wrapper for the Gradio progress object that provides a clear and
+    intuitive progress display for both single and multi-book processing.
+    """
+    def __init__(self, progress, num_total_chunks, ebook_idx, num_ebooks, start_time):
+        self._progress = progress
+        self.num_total_chunks = num_total_chunks
+        self.ebook_idx = ebook_idx
+        self.num_ebooks = num_ebooks
+        self.start_time = start_time
+        self.current_chunk_idx = 0
+
+    def set_chunk_index(self, i):
+        """Sets the index of the current chunk being processed."""
+        self.current_chunk_idx = i
+
+    def __call__(self, value, desc=None):
+        """
+        This method is called to update the progress bar.
+        `value` controls the overall progress bar and the final percentage display.
+        `desc` contains chunk-specific details from the underlying process.
+        """
+        # --- Percentage Calculation for the Current Book ---
+        chunk_percent = 0.0
+        if desc:
+            match = re.search(r'(\d+\.?\d*)%', desc)
+            if match:
+                try: chunk_percent = float(match.group(1))
+                except ValueError: chunk_percent = 0.0
+
+        book_progress_fraction = (self.current_chunk_idx + (chunk_percent / 100.0)) / self.num_total_chunks
+        book_progress_percent = book_progress_fraction * 100
+
+        # --- Time Calculations ---
+        elapsed_seconds = time.time() - self.start_time
+        elapsed_str = time.strftime('%H:%M:%S', time.gmtime(elapsed_seconds))
+
+        etr_str = "Calculating..."
+        if elapsed_seconds > 2 and book_progress_fraction > 0.001:
+            try:
+                total_estimated_time = elapsed_seconds / book_progress_fraction
+                etr_seconds = max(0, total_estimated_time - elapsed_seconds)
+                etr_str = time.strftime('%H:%M:%S', time.gmtime(etr_seconds))
+            except ZeroDivisionError:
+                 etr_str = "Calculating..."
+
+        # --- Construct the Final, Clearer Description String ---
+        # The redundant percentage at the end is added by Gradio automatically.
+        # This version removes the manual "Overall Progress" from the start
+        # to avoid duplication. The percentage at the end now serves as the overall indicator.
+        if self.num_ebooks > 1:
+            final_desc = (
+                f"Current Book: {self.ebook_idx + 1}/{self.num_ebooks} ({book_progress_percent:.1f}%) | "
+                f"Chunk {self.current_chunk_idx + 1}/{self.num_total_chunks} | "
+                f"Elapsed: {elapsed_str} | ETR: {etr_str}"
+            )
+        else:
+            final_desc = (
+                f"Chunk {self.current_chunk_idx + 1}/{self.num_total_chunks} | "
+                f"Elapsed: {elapsed_str} | ETR: {etr_str}"
+            )
+
+        # Update the Gradio progress bar. The `value` argument controls both the
+        # visual bar and the percentage that Gradio appends to `desc`.
+        self._progress(value, desc=final_desc)
+
+
 # Load models
 vocoder = load_vocoder()
 
@@ -68,8 +138,8 @@ def load_f5tts(ckpt_path=None):
         "conv_layers": 4
     }
     model = load_model(DiT, model_cfg, ckpt_path)
-    model.eval()  # Ensure the model is in evaluation mode
-    model = model.to(device)  # Move model to the selected device
+    model.eval()
+    model = model.to(device)
     print(f"Model loaded on {device}.")
     return model
 
@@ -80,19 +150,13 @@ chat_tokenizer_state = None
 
 @gpu_decorator
 def generate_response(messages, model, tokenizer):
-    """Generate a response using the provided model and tokenizer with full precision."""
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
     )
-
     model_inputs = tokenizer([text], return_tensors="pt").to(device)
-
-    # Increase max_new_tokens to a much larger number to avoid truncation
-    # Previously: max_new_tokens=1024
-    max_new_tokens = 1000000  # Large number to allow full generation
-
+    max_new_tokens = 1000000
     with torch.no_grad():
         generated_ids = model.generate(
             input_ids=model_inputs.input_ids,
@@ -102,21 +166,16 @@ def generate_response(messages, model, tokenizer):
             do_sample=True,
             repetition_penalty=1.2,
         )
-
     if not generated_ids:
         raise ValueError("No generated IDs returned by the model.")
-
     generated_ids = [
         output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
     ]
-
     if not generated_ids or not generated_ids[0]:
         raise ValueError("Generated IDs are empty after processing.")
-
     return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
 def extract_metadata_and_cover(ebook_path):
-    """Extract cover image from the eBook."""
     try:
         cover_path = os.path.splitext(ebook_path)[0] + '.jpg'
         subprocess.run(['ebook-meta', ebook_path, '--get-cover', cover_path], check=True)
@@ -127,60 +186,49 @@ def extract_metadata_and_cover(ebook_path):
     return None
 
 def embed_metadata_into_mp3(mp3_path, cover_image_path, title, author, album_title=None):
-    """Embed cover image, title, author, and album into the MP3 file's metadata."""
     try:
         audio = ID3(mp3_path)
-    except error: # If no ID3 tag exists, create one
+    except error:
         audio = ID3()
     except Exception as e:
         print(f"Error loading ID3 tags for {mp3_path}: {e}. Creating new tags.")
-        audio = ID3() # Fallback to creating new tags
+        audio = ID3()
 
-    # Add Title
-    audio.delall("TIT2") # Remove existing title tags
+    audio.delall("TIT2")
     audio.add(TIT2(encoding=3, text=title))
     print(f"Set TIT2 (Title) to: {title}")
 
-    # Add Author/Artist
-    audio.delall("TPE1") # Remove existing artist tags
+    audio.delall("TPE1")
     audio.add(TPE1(encoding=3, text=author))
     print(f"Set TPE1 (Author/Artist) to: {author}")
 
-    # Add Album (often used for Book Title in audiobook players)
-    # If a specific album_title is provided, use it. Otherwise, use the main title.
     album_to_set = album_title if album_title else title
-    audio.delall("TALB") # Remove existing album tags
+    audio.delall("TALB")
     audio.add(TALB(encoding=3, text=album_to_set))
     print(f"Set TALB (Album) to: {album_to_set}")
 
-    # Embed Cover Image (existing logic)
     if cover_image_path and os.path.exists(cover_image_path):
-        audio.delall("APIC") # Remove existing cover art
+        audio.delall("APIC")
         try:
             with open(cover_image_path, 'rb') as img:
                 audio.add(APIC(
-                    encoding=3,          # 3 is for UTF-8
-                    mime='image/jpeg',   # or 'image/png'
-                    type=3,              # 3 means front cover
-                    desc='Front cover',
-                    data=img.read()
+                    encoding=3, mime='image/jpeg', type=3,
+                    desc='Front cover', data=img.read()
                 ))
             print(f"Embedded cover image into {mp3_path}")
         except Exception as e:
             print(f"Failed to embed cover image into MP3: {e}")
     else:
         print(f"No cover image provided or found at '{cover_image_path}'. Skipping cover embedding.")
-        audio.delall("APIC") # Ensure no old APIC tag remains if new cover is not set
+        audio.delall("APIC")
 
     try:
-        # Save with ID3v2.3 for broad compatibility
         audio.save(mp3_path, v2_version=3)
         print(f"Successfully saved metadata to {mp3_path}")
     except Exception as e:
         print(f"Failed to save MP3 metadata: {e}")
 
 def extract_text_and_title_from_epub(epub_path):
-    """Extract full text, title, and author from an EPUB file in reading order."""
     try:
         book = epub.read_epub(epub_path)
         print(f"EPUB '{epub_path}' successfully read.")
@@ -189,10 +237,9 @@ def extract_text_and_title_from_epub(epub_path):
 
     text_content = []
     title = None
-    author = None # Initialize author
+    author = None
 
     try:
-        # Extract title
         title_metadata = book.get_metadata('DC', 'title')
         if title_metadata:
             title = title_metadata[0][0]
@@ -201,27 +248,22 @@ def extract_text_and_title_from_epub(epub_path):
             title = os.path.splitext(os.path.basename(epub_path))[0]
             print(f"No title in metadata. Using filename: {title}")
 
-        # Extract author
         author_metadata = book.get_metadata('DC', 'creator')
         if author_metadata:
-            # Assuming the first creator is the primary author
             author = author_metadata[0][0]
             print(f"Extracted author: {author}")
         else:
-            author = "Unknown Author" # Default if no author found
+            author = "Unknown Author"
             print(f"No author in metadata. Using '{author}'.")
-
-    except Exception as e: # Catch potential errors during metadata extraction
+    except Exception as e:
         print(f"Error extracting metadata: {e}")
-        if title is None: # Ensure title has a fallback
+        if title is None:
             title = os.path.splitext(os.path.basename(epub_path))[0]
             print(f"Using filename as title due to error: {title}")
-        if author is None: # Ensure author has a fallback
+        if author is None:
             author = "Unknown Author"
             print(f"Using '{author}' due to error in metadata extraction.")
 
-
-    # Iterate over the book's spine in reading order
     for spine_item in book.spine:
         item = book.get_item_with_id(spine_item[0])
         if item and item.get_type() == ITEM_DOCUMENT:
@@ -234,15 +276,12 @@ def extract_text_and_title_from_epub(epub_path):
                 print(f"Error parsing document item {item.get_id()}: {e}")
 
     full_text = ' '.join(text_content)
-
     if not full_text:
         raise ValueError("No text found in EPUB file.")
-
     print(f"Extracted {len(full_text)} characters from EPUB.")
-    return full_text, title, author # Return author
+    return full_text, title, author
 
 def convert_to_epub(input_path, output_path):
-    """Convert an ebook to EPUB format using Calibre."""
     try:
         ensure_directory(os.path.dirname(output_path))
         subprocess.run(['ebook-convert', input_path, output_path], check=True)
@@ -254,7 +293,6 @@ def convert_to_epub(input_path, output_path):
         raise RuntimeError(f"Unexpected error during conversion: {e}")
 
 def detect_file_type(file_path):
-    """Detect the MIME type of a file."""
     try:
         mime = magic.Magic(mime=True)
         return mime.from_file(file_path)
@@ -262,61 +300,46 @@ def detect_file_type(file_path):
         raise RuntimeError(f"Error detecting file type: {e}")
 
 def ensure_directory(directory_path):
-    """Ensure that a directory exists."""
     try:
         os.makedirs(directory_path, exist_ok=True)
     except Exception as e:
         raise RuntimeError(f"Error creating directory {directory_path}: {e}")
 
 def sanitize_filename(filename):
-    """Sanitize a filename by removing invalid characters."""
-    sanitized = re.sub(r'[\\/*?:"<>|]', "", filename)
+    # CORRECTED: Added apostrophe to the list of characters to remove
+    sanitized = re.sub(r'[\\/*?:"<>|\']', "", filename)
     return sanitized.replace(" ", "_")
 
 def show_converted_audiobooks():
-    """List all converted audiobook files."""
     output_dir = os.path.join("Working_files", "Book")
     if not os.path.exists(output_dir):
         return ["No audiobooks found."]
-
     files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.endswith(('.mp3', '.m4b'))]
     if not files:
         return ["No audiobooks found."]
-
     return files
 
 @gpu_decorator
 def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, show_info=gr.Info, progress=gr.Progress(),
-          progress_start_fraction=0.0, progress_end_fraction=1.0, ebook_idx=0, num_ebooks=1): # Added ebook_idx, num_ebooks
-    """Perform inference to generate audio from text without truncation."""
+          progress_start_fraction=0.0, progress_end_fraction=1.0, ebook_idx=0, num_ebooks=1):
     try:
         ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=show_info)
     except Exception as e:
         raise RuntimeError(f"Error in preprocessing reference audio and text: {e}")
-
     if not gen_text.strip():
         raise ValueError("Generated text is empty. Please provide valid text content.")
-
     try:
         with torch.no_grad():
             final_wave, final_sample_rate, _ = infer_process(
-                ref_audio,
-                ref_text,
-                gen_text,
-                F5TTS_ema_model,
-                vocoder,
-                cross_fade_duration=cross_fade_duration,
-                speed=speed,
-                show_info=show_info,
-                progress=progress,
+                ref_audio, ref_text, gen_text, F5TTS_ema_model, vocoder,
+                cross_fade_duration=cross_fade_duration, speed=speed,
+                show_info=show_info, progress=progress,
                 progress_start_fraction=progress_start_fraction,
                 progress_end_fraction=progress_end_fraction,
-                ebook_idx=ebook_idx,        # Pass down
-                num_ebooks=num_ebooks       # Pass down
+                ebook_idx=ebook_idx, num_ebooks=num_ebooks
             )
     except Exception as e:
         raise RuntimeError(f"Error during inference process: {e}")
-
     print(f"Generated audio length: {len(final_wave)} samples at {final_sample_rate} Hz.")
     return (final_sample_rate, final_wave), ref_text
 
@@ -325,44 +348,24 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
     try:
         processed_audiobooks = []
         num_ebooks = len(gen_file_input)
-
-        # Define relative durations (fractions) for stages within ONE ebook's processing cycle.
-        # These should sum to 1.0 for one ebook.
-        ebook_frac = {
-            "init_detect_convert": 0.005,  # 2% for initial setup, detection, and potential conversion
-            "extract_text":        0.005,  # 2% for text extraction
-            "infer":               0.89,  # 86% for the main TTS inference (bulk of the time)
-            "stitch":              0.03,  # 3% for audio stitching
-            "mp3_meta":            0.07,  # 7% for MP3 conversion and metadata embedding
-            # Total: 0.02 + 0.02 + 0.86 + 0.03 + 0.07 = 1.00
-        }
+        ebook_frac = {"init_detect_convert": 0.005, "extract_text": 0.005, "infer": 0.89, "mp3_meta": 0.10}
 
         for idx, ebook_file_data in enumerate(gen_file_input):
             current_ebook_base_progress = idx / float(num_ebooks)
-            
-            # This variable will track the progress offset *within the current ebook's allocated slot*
-            # It represents how much of the current ebook's 1/num_ebooks fraction is completed by prior stages.
             progress_offset_within_ebook = 0.0
-
             original_ebook_path = ebook_file_data.name
             if not os.path.exists(original_ebook_path):
-                progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (File Not Found: {os.path.basename(original_ebook_path)})")
-                continue 
-
-            epub_path_for_extraction = original_ebook_path
-            temp_epub_created = False
+                progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (File Not Found)")
+                continue
 
             # --- Stage: File detection and conversion ---
             desc_suffix = "Detecting file type..."
-            # Show progress at the very start of this stage for this ebook
-            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
-                     desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
-            
+            progress(current_ebook_base_progress, desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
+            epub_path_for_extraction, temp_epub_created = (original_ebook_path, False)
             file_type = detect_file_type(original_ebook_path)
             if file_type != 'application/epub+zip':
                 desc_suffix = "Converting to EPUB..."
-                progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
-                         desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
+                progress(current_ebook_base_progress, desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
                 sanitized_base = sanitize_filename(os.path.splitext(os.path.basename(original_ebook_path))[0])
                 temp_epub_dir = os.path.join("Working_files", "temp_converted")
                 ensure_directory(temp_epub_dir)
@@ -374,137 +377,163 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
                 except Exception as e:
                     print(f"Error converting {original_ebook_path} to EPUB: {e}. Skipping.")
                     progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (Conversion Error)")
-                    continue 
-            
-            # Update progress offset after this stage
+                    continue
             progress_offset_within_ebook += ebook_frac["init_detect_convert"]
-            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
-                     desc=f"Ebook {idx+1}/{num_ebooks}: File prepped.")
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: File prepped.")
 
             # --- Stage: Extracting text ---
             desc_suffix = "Extracting text..."
-            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
-                     desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
-            
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
             try:
                 gen_text, ebook_title, ebook_author = extract_text_and_title_from_epub(epub_path_for_extraction)
-                cover_image = extract_metadata_and_cover(epub_path_for_extraction) 
+                cover_image = extract_metadata_and_cover(epub_path_for_extraction)
             except Exception as e:
                 print(f"Error extracting text/metadata from {epub_path_for_extraction}: {e}. Skipping.")
                 progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (Text Extraction Error)")
                 if temp_epub_created and os.path.exists(epub_path_for_extraction): os.remove(epub_path_for_extraction)
                 continue
-
             ref_text = ref_text_input or ""
-            
-            # Update progress offset after this stage
             progress_offset_within_ebook += ebook_frac["extract_text"]
-            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
-                     desc=f"Ebook {idx+1}/{num_ebooks}: Text extracted.")
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Text extracted.")
 
-            # --- Stage: Inference ---
-            # `overall_infer_start_frac` is the progress point where inference begins.
-            # It's the base progress for this ebook + what's consumed by prior stages within this ebook's slot.
+            # --- Stage: Inference and Chunk-based Audio Generation ---
             overall_infer_start_frac = current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks)
-            
-            # `overall_infer_end_frac` is where inference is expected to end.
-            overall_infer_end_frac = overall_infer_start_frac + (ebook_frac["infer"] / num_ebooks)
-            
-            # This message appears just before calling infer().
-            # The `utils_infer.py` will then immediately show its "0.0%" message for chunk processing.
-            progress(overall_infer_start_frac, desc=f"Ebook {idx+1}/{num_ebooks}: Preparing audio synthesis...")
+            temp_chunks_dir = os.path.join("Working_files", "temp_audio_chunks", sanitize_filename(ebook_title))
+            ensure_directory(temp_chunks_dir)
+            chunk_file_paths = []
+
+            print("Tokenizing text into sentences for stable chunking...")
+            sentences = sent_tokenize(gen_text)
+            SENTENCES_PER_CHUNK = 75
+            text_super_chunks = [' '.join(sentences[i:i + SENTENCES_PER_CHUNK]) for i in range(0, len(sentences), SENTENCES_PER_CHUNK)]
+            num_super_chunks = len(text_super_chunks)
+
+            if num_super_chunks == 0:
+                print(f"Error: No text chunks could be created from {ebook_title}. Skipping.")
+                continue
+
+            print(f"Book text split into {num_super_chunks} sentence-based super-chunks for processing.")
+
+            ebook_start_time = time.time()
+            progress_updater = EbookProgressUpdater(
+                progress=progress,
+                num_total_chunks=num_super_chunks,
+                ebook_idx=idx,
+                num_ebooks=num_ebooks,
+                start_time=ebook_start_time
+            )
 
             try:
-                audio_out, _ = infer(
-                    ref_audio_input,
-                    ref_text,
-                    gen_text,
-                    cross_fade_duration,
-                    speed,
-                    show_info=gr.Info,
-                    progress=progress,
-                    ebook_idx=idx,
-                    num_ebooks=num_ebooks,
-                    progress_start_fraction=overall_infer_start_frac, # Pass the calculated start
-                    progress_end_fraction=overall_infer_end_frac     # Pass the calculated end
-                )
+                for i, text_chunk in enumerate(text_super_chunks):
+                    progress_updater.set_chunk_index(i)
+
+                    chunk_progress_start = overall_infer_start_frac + (i / num_super_chunks) * (ebook_frac["infer"] / num_ebooks)
+                    chunk_progress_end = overall_infer_start_frac + ((i + 1) / num_super_chunks) * (ebook_frac["infer"] / num_ebooks)
+
+                    progress_updater(chunk_progress_start)
+                    
+                    # CORRECTED: Added try...finally for robust memory cleanup
+                    wave_chunk = None # Initialize to None
+                    try:
+                        audio_out_chunk, _ = infer(
+                            ref_audio_input, ref_text, text_chunk,
+                            cross_fade_duration, speed, show_info=gr.Info,
+                            progress=progress_updater,
+                            ebook_idx=idx, num_ebooks=num_ebooks,
+                            progress_start_fraction=chunk_progress_start,
+                            progress_end_fraction=chunk_progress_end
+                        )
+                        sample_rate_chunk, wave_chunk = audio_out_chunk
+                    finally:
+                        # This cleanup now runs even if `infer` throws an error
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                    if wave_chunk is not None and wave_chunk.any():
+                        chunk_path = os.path.join(temp_chunks_dir, f"chunk_{i:04d}.wav")
+                        sf.write(chunk_path, wave_chunk, sample_rate_chunk)
+                        chunk_file_paths.append(chunk_path)
+                    else:
+                        print(f"Warning: Empty audio returned for super-chunk {i+1}. Skipping this part.")
             except Exception as e:
-                print(f"Error during TTS inference for {ebook_title}: {e}. Skipping.")
-                progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (Inference Error)")
-                if temp_epub_created and os.path.exists(epub_path_for_extraction): os.remove(epub_path_for_extraction)
-                if cover_image and os.path.exists(cover_image): os.remove(cover_image)
+                print(f"Error during TTS inference loop for {ebook_title}: {e}")
                 continue
-            
-            # Update progress offset after inference.
-            # The `infer` function itself will drive progress between overall_infer_start_frac and overall_infer_end_frac.
-            # So, after it finishes, progress_offset_within_ebook should be at the end of inference's allocation.
+
+            if not chunk_file_paths:
+                print(f"Error: No audio chunks were generated for {ebook_title}. Skipping book.")
+                continue
+
             progress_offset_within_ebook += ebook_frac["infer"]
-            # progress() call here is implicitly handled by the end of the infer() function.
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Audio synthesized.")
 
-            # --- Stage: Stitching ---
-            desc_suffix = "Stitching audio..."
-            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
-                     desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
-            
-            sample_rate, wave = audio_out
-            if not wave.any(): # Check if wave is empty
-                print(f"Warning: Generated audio wave is empty for {ebook_title}. Skipping.")
-                progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (Empty Audio)")
-                if temp_epub_created and os.path.exists(epub_path_for_extraction): os.remove(epub_path_for_extraction)
-                if cover_image and os.path.exists(cover_image): os.remove(cover_image)
-                continue
-
-            temp_audio_dir = os.path.join("Working_files", "temp_audio")
-            ensure_directory(temp_audio_dir)
-            tmp_wav_path = "" # Initialize
-            try:
-                with tempfile.NamedTemporaryFile(dir=temp_audio_dir, delete=False, suffix=".wav") as tmp_wav:
-                    sf.write(tmp_wav.name, wave, sample_rate)
-                    tmp_wav_path = tmp_wav.name
-            except Exception as e:
-                print(f"Error writing temporary WAV for {ebook_title}: {e}. Skipping.")
-                progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (WAV Error)")
-                if temp_epub_created and os.path.exists(epub_path_for_extraction): os.remove(epub_path_for_extraction)
-                if cover_image and os.path.exists(cover_image): os.remove(cover_image)
-                continue
-            
-            # Update progress offset
-            progress_offset_within_ebook += ebook_frac["stitch"]
-            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
-                     desc=f"Ebook {idx+1}/{num_ebooks}: Audio stitched.")
-
-            # --- Stage: MP3 Conversion & Metadata ---
-            desc_suffix = "Converting to MP3 & adding metadata..."
-            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
-                     desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
-
+            # --- Stage: MP3 Conversion & Metadata using FFmpeg Concat ---
+            desc_suffix = "Finalizing MP3 & adding metadata..."
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: {desc_suffix}")
             sanitized_title = sanitize_filename(ebook_title) or f"audiobook_{idx}"
             final_mp3_dir = os.path.join("Working_files", "Book")
-            ensure_directory(final_mp3_dir)
-            tmp_mp3_path = os.path.join(final_mp3_dir, f"{sanitized_title}.mp3")
+            final_mp3_path = os.path.join(final_mp3_dir, f"{sanitized_title}.mp3")
 
+            # CORRECTED: Entire FFmpeg block replaced for robustness
             try:
-                audio = AudioSegment.from_wav(tmp_wav_path)
-                audio.export(tmp_mp3_path, format="mp3", bitrate="320k", parameters=["-q:a", "0"]) # Consider "192k" for smaller files
-                embed_metadata_into_mp3(tmp_mp3_path, cover_image, ebook_title, ebook_author, album_title=ebook_title)
+                concat_list_path = os.path.join(temp_chunks_dir, "concat_list.txt")
+                with open(concat_list_path, 'w') as f:
+                    for path in chunk_file_paths:
+                        # Use relative paths for robustness
+                        chunk_filename = os.path.basename(path)
+                        f.write(f"file '{chunk_filename}'\n")
+
+                # Ensure the final output directory exists before running FFmpeg
+                ensure_directory(final_mp3_dir)
+
+                # Command uses relative paths, so it must be run from the chunks directory
+                ffmpeg_command = [
+                    'ffmpeg', '-f', 'concat', '-safe', '0', '-i', 'concat_list.txt',
+                    '-b:a', '192k', '-y', os.path.abspath(final_mp3_path) # Use absolute path for the output file
+                ]
+
+                print(f"Starting FFmpeg concatenation for {len(chunk_file_paths)} chunks...")
+                print(f"Executing command: {' '.join(ffmpeg_command)} in directory {temp_chunks_dir}")
+
+                # Use Popen for better process control and logging on long tasks
+                process = subprocess.Popen(
+                    ffmpeg_command,
+                    cwd=temp_chunks_dir,  # CRITICAL: Execute FFmpeg in the chunks directory
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding='utf-8'
+                )
+
+                # Stream stdout and stderr to print progress and errors in real-time
+                stdout, stderr = process.communicate()
+
+                if process.returncode != 0:
+                    print("--- FFmpeg Error ---")
+                    print("Return Code:", process.returncode)
+                    print("\n--- FFmpeg STDOUT ---")
+                    print(stdout)
+                    print("\n--- FFmpeg STDERR ---")
+                    print(stderr)
+                    raise gr.Error(f"FFmpeg failed for {ebook_title}. Check console for detailed logs.")
+                else:
+                    print("FFmpeg concatenation successful.")
+                    embed_metadata_into_mp3(final_mp3_path, cover_image, ebook_title, ebook_author, album_title=ebook_title)
+
             except Exception as e:
-                print(f"Error during MP3 conversion/metadata for {ebook_title}: {e}. Skipping.")
-                progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (MP3/Meta Error)")
-                if os.path.exists(tmp_wav_path): os.remove(tmp_wav_path)
-                if temp_epub_created and os.path.exists(epub_path_for_extraction): os.remove(epub_path_for_extraction)
-                if cover_image and os.path.exists(cover_image): os.remove(cover_image)
-                continue
+                print(f"An error occurred during the FFmpeg/metadata stage for {ebook_title}: {e}")
+                continue # Skip to the next book
+            finally:
+                import shutil
+                if os.path.exists(temp_chunks_dir):
+                    print(f"Cleaning up temporary directory: {temp_chunks_dir}")
+                    shutil.rmtree(temp_chunks_dir)
 
-            # Update progress offset
+
             progress_offset_within_ebook += ebook_frac["mp3_meta"]
-            # Final progress update for this ebook should reach the end of its allocated slot
-            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), 
-                     desc=f"Ebook {idx+1}/{num_ebooks}: MP3 created.")
+            progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: MP3 created.")
 
-            # Cleanup
-            if os.path.exists(tmp_wav_path):
-                try: os.remove(tmp_wav_path)
-                except OSError as e: print(f"Error removing temp WAV {tmp_wav_path}: {e}")
+            # --- Final Cleanup for this book ---
             if cover_image and os.path.exists(cover_image):
                 try: os.remove(cover_image)
                 except OSError as e: print(f"Error removing temp cover {cover_image}: {e}")
@@ -512,132 +541,77 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
                 try: os.remove(epub_path_for_extraction)
                 except OSError as e: print(f"Error removing temp EPUB {epub_path_for_extraction}: {e}")
 
-            processed_audiobooks.append(tmp_mp3_path)
-            # Ensure progress reaches the end for this ebook; progress_offset_within_ebook should be ~1.0 here.
-            # If ebook_frac sums to 1.0, then current_ebook_base_progress + (1.0 / num_ebooks) is (idx+1)/num_ebooks
+            processed_audiobooks.append(final_mp3_path)
             final_ebook_progress = (idx + 1) / float(num_ebooks)
             progress(final_ebook_progress, desc=f"Ebook {idx+1}/{num_ebooks}: Completed.")
-            yield tmp_mp3_path, processed_audiobooks
-        
-        # Final progress update if all ebooks processed successfully
-        if num_ebooks > 0 and not processed_audiobooks and idx == num_ebooks -1 : # All skipped
-             progress(1.0, desc="All eBooks skipped or failed processing.")
-        elif processed_audiobooks : # At least one processed
-             progress(1.0, desc=f"All {num_ebooks} eBook(s) processing finished.")
+            yield final_mp3_path, processed_audiobooks
 
+        if num_ebooks > 0 and not processed_audiobooks and locals().get('idx') == num_ebooks - 1:
+            progress(1.0, desc="All eBooks skipped or failed processing.")
+        elif processed_audiobooks:
+            progress(1.0, desc=f"All {num_ebooks} eBook(s) processing finished.")
 
     except Exception as e:
-        print(f"An error occurred in basic_tts: {e}")
+        print(f"An unhandled error occurred in basic_tts: {e}")
         import traceback
         traceback.print_exc()
-        if progress and hasattr(progress, '__call__'): 
-            try:
-                progress_val_on_error = 0.0
-                if 'idx' in locals() and 'num_ebooks' in locals() and num_ebooks > 0:
-                     progress_val_on_error = (idx / float(num_ebooks)) 
-                current_progress_desc = f"Error processing"
-                if 'idx' in locals() and 'num_ebooks' in locals():
-                    current_progress_desc = f"Ebook {idx+1}/{num_ebooks}: Error"
-                progress(progress_val_on_error, desc=f"{current_progress_desc} - {str(e)[:100]}. Check logs.") # Truncate error
-            except Exception as pe: 
-                print(f"Error updating progress during exception handling: {pe}")
         raise gr.Error(f"An error occurred: {str(e)}")
 
-DEFAULT_REF_AUDIO_PATH = "/app/default_voice.mp3" 
+DEFAULT_REF_AUDIO_PATH = "/app/default_voice.mp3"
 DEFAULT_REF_TEXT = "For thirty-six years I was the confidential secretary of the Roman statesman Cicero. At first this was exciting, then astonishing, then arduous, and finally extremely dangerous."
-
 
 def create_gradio_app():
     """Create and configure the Gradio application."""
-    with gr.Blocks(theme=gr.themes.Ocean()) as app: # Use gr.themes.Ocean if available, else None
+    with gr.Blocks(theme=gr.themes.Ocean()) as app:
         gr.Markdown("# eBook to Audiobook with F5-TTS!")
-
         ref_audio_input = gr.Audio(
             label="Upload Voice File (<15 sec) or Record with Mic Icon (Ensure Natural Phrasing, Trim Silence)",
-            type="filepath",
-            value=DEFAULT_REF_AUDIO_PATH
+            type="filepath", value=DEFAULT_REF_AUDIO_PATH
         )
-
         gen_file_input = gr.Files(
             label="Upload eBook or Multiple for Batch Processing (epub, mobi, pdf, txt, html)",
             file_types=[".epub", ".mobi", ".pdf", ".txt", ".html"],
-            # Assuming 'filepath' was intended here based on previous context,
-            # but if it's causing issues or not what you want, adjust as needed.
-            # Gradio's gr.Files often works with a list of file paths or temp files.
-            # type="filepath", # This might be redundant if file_count="multiple" handles it
             file_count="multiple",
         )
-
-        # Buttons are now stacked vertically. full_width removed for compatibility.
         generate_btn = gr.Button("Start", variant="primary")
         show_audiobooks_btn = gr.Button("Show All Completed Audiobooks", variant="secondary")
-
         audiobooks_output = gr.Files(label="Converted Audiobooks (Download Links)")
         player = gr.Audio(label="Play Latest Converted Audiobook", interactive=False)
-
         with gr.Accordion("Advanced Settings", open=False):
             ref_text_input = gr.Textbox(
                 label="Reference Text (Leave Blank for Automatic Transcription)",
-                lines=2,
-                value=DEFAULT_REF_TEXT
+                lines=2, value=DEFAULT_REF_TEXT
             )
             speed_slider = gr.Slider(
                 label="Speech Speed (Adjusting Can Cause Artifacts)",
-                minimum=0.3,
-                maximum=2.0,
-                value=1.0,
-                step=0.1,
+                minimum=0.3, maximum=2.0, value=1.0, step=0.1,
             )
             cross_fade_duration_slider = gr.Slider(
                 label="Cross-Fade Duration (Between Generated Audio Chunks)",
-                minimum=0.0,
-                maximum=1.0,
-                value=0.0,
-                step=0.01,
+                minimum=0.0, maximum=1.0, value=0.0, step=0.01,
             )
-
         generate_btn.click(
             basic_tts,
-            inputs=[
-                ref_audio_input,
-                ref_text_input,
-                gen_file_input,
-                cross_fade_duration_slider,
-                speed_slider,
-            ],
+            inputs=[ref_audio_input, ref_text_input, gen_file_input, cross_fade_duration_slider, speed_slider],
             outputs=[player, audiobooks_output],
-            
         )
-
         show_audiobooks_btn.click(
-            show_converted_audiobooks,
-            inputs=[],
-            outputs=[audiobooks_output],
+            show_converted_audiobooks, inputs=[], outputs=[audiobooks_output],
         )
-
     return app
 
 @click.command()
 @click.option("--port", "-p", default=None, type=int, help="Port to run the app on")
 @click.option("--host", "-H", default=None, help="Host to run the app on")
-@click.option(
-    "--share",
-    "-s",
-    default=False,
-    is_flag=True,
-    help="Share the app via Gradio share link",
-)
+@click.option("--share", "-s", default=False, is_flag=True, help="Share the app via Gradio share link")
 @click.option("--api", "-a", default=True, is_flag=True, help="Allow API access")
 def main(port, host, share, api):
     """Main entry point to launch the Gradio app."""
     app = create_gradio_app()
     print("Starting app...")
     app.queue().launch(
-        server_name="0.0.0.0",
-        server_port=port or 7860,
-        share=share,
-        show_api=api,
-        debug=True
+        server_name="0.0.0.0", server_port=port or 7860,
+        share=share, show_api=api, debug=True
     )
 
 if __name__ == "__main__":
