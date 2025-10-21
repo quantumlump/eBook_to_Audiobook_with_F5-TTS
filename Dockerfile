@@ -124,7 +124,7 @@ RUN mkdir -p "${NLTK_DATA}" && echo "NLTK_DATA directory ${NLTK_DATA} created."
 
 # Download NLTK punkt data. This runs after NLTK is installed.
 RUN echo "Attempting to download NLTK punkt using CLI..." && \
-    python -m nltk.downloader -d "${NLTK_DATA}" punkt && \
+    python -m nltk.downloader -d "${NLTK_DATA}" all && \
     echo "NLTK punkt download command executed."
 
 # Verify NLTK punkt installation
