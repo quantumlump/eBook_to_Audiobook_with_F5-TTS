@@ -91,21 +91,31 @@ class EbookProgressUpdater:
 
         # --- Time Calculations ---
         elapsed_seconds = time.time() - self.start_time
-        elapsed_str = time.strftime('%H:%M:%S', time.gmtime(elapsed_seconds))
+        
+        # Correctly format elapsed time to handle >24 hours
+        elapsed_hours = int(elapsed_seconds // 3600)
+        elapsed_minutes = int((elapsed_seconds % 3600) // 60)
+        elapsed_secs = int(elapsed_seconds % 60)
+        elapsed_str = f"{elapsed_hours:02d}:{elapsed_minutes:02d}:{elapsed_secs:02d}"
 
         etr_str = "Calculating..."
         if elapsed_seconds > 2 and book_progress_fraction > 0.001:
             try:
                 total_estimated_time = elapsed_seconds / book_progress_fraction
                 etr_seconds = max(0, total_estimated_time - elapsed_seconds)
-                etr_str = time.strftime('%H:%M:%S', time.gmtime(etr_seconds))
+
+                # --- CORRECTED ETR CALCULATION ---
+                # Manually calculate hours, minutes, and seconds to prevent rolling over at 24 hours.
+                etr_hours = int(etr_seconds // 3600)
+                etr_minutes = int((etr_seconds % 3600) // 60)
+                etr_secs = int(etr_seconds % 60)
+                etr_str = f"{etr_hours:02d}:{etr_minutes:02d}:{etr_secs:02d}"
+                # --- END OF CORRECTION ---
+
             except ZeroDivisionError:
                  etr_str = "Calculating..."
 
         # --- Construct the Final, Clearer Description String ---
-        # The redundant percentage at the end is added by Gradio automatically.
-        # This version removes the manual "Overall Progress" from the start
-        # to avoid duplication. The percentage at the end now serves as the overall indicator.
         if self.num_ebooks > 1:
             final_desc = (
                 f"Current Book: {self.ebook_idx + 1}/{self.num_ebooks} ({book_progress_percent:.1f}%) | "
@@ -118,8 +128,6 @@ class EbookProgressUpdater:
                 f"Elapsed: {elapsed_str} | ETR: {etr_str}"
             )
 
-        # Update the Gradio progress bar. The `value` argument controls both the
-        # visual bar and the percentage that Gradio appends to `desc`.
         self._progress(value, desc=final_desc)
 
 
@@ -348,7 +356,7 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
     try:
         processed_audiobooks = []
         num_ebooks = len(gen_file_input)
-        ebook_frac = {"init_detect_convert": 0.005, "extract_text": 0.005, "infer": 0.89, "mp3_meta": 0.10}
+        ebook_frac = {"init_detect_convert": 0.001, "extract_text": 0.001, "infer": 0.997, "mp3_meta": 0.001}
 
         for idx, ebook_file_data in enumerate(gen_file_input):
             current_ebook_base_progress = idx / float(num_ebooks)
