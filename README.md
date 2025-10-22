@@ -8,7 +8,7 @@ Turn your eBooks into audiobooks using the F5-TTS text-to-speech model. This app
 Copy and paste this single command line into command prompt to get the app running locally in Docker (Nvidia card accelerated)(11GB)(can take a long time to load, check CPU usage once download is finished, if CPU usage is high, it is loading correctly):
 
 ```bash
-curl -L "https://huggingface.co/jdana/f5tts_offline_ebook_to_audiobook_Docker_image/resolve/main/f5tts-app-preloaded_2025-05-29.tar" -o f5tts-app-preloaded_2025-05-29.tar && docker load < f5tts-app-preloaded_2025-05-29.tar && docker tag 21fad7b5127e f5tts:latest && docker run --rm -it --gpus all -p 7860:7860 f5tts:latest && del f5tts-app-preloaded_2025-05-29.tar
+curl -L "https://huggingface.co/jdana/f5tts_offline_ebook_to_audiobook_Docker_image/resolve/main/f5tts-app-preloaded_2025-10-21.tar" -o f5tts-app-preloaded_2025-10-21.tar && docker load < f5tts-app-preloaded_2025-10-21.tar && docker tag 21fad7b5127e f5tts:latest && docker run --rm -it --gpus all -p 7860:7860 f5tts:latest && del f5tts-app-preloaded_2025-10-21.tar
 
 ```
 
