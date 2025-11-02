@@ -7,6 +7,7 @@ import csv
 import time
 from collections import OrderedDict
 from importlib.resources import files
+from num2words import num2words
 
 import click
 import gradio as gr
@@ -48,6 +49,11 @@ except ImportError:
     USING_SPACES = False
 
 DEFAULT_TTS_MODEL = "F5-TTS"
+
+def silent_info(*args, **kwargs):
+    """A dummy function to suppress gr.Info notifications."""
+    pass
+
 
 # GPU Decorator
 def gpu_decorator(func):
@@ -237,57 +243,141 @@ def embed_metadata_into_mp3(mp3_path, cover_image_path, title, author, album_tit
         print(f"Failed to save MP3 metadata: {e}")
 
 def extract_text_and_title_from_epub(epub_path):
+    """
+    Extracts and meticulously cleans text from an EPUB file for high-quality TTS.
+    This includes metadata extraction, citation removal, and extensive text normalization.
+    """
     try:
         book = epub.read_epub(epub_path)
-        print(f"EPUB '{epub_path}' successfully read.")
     except Exception as e:
         raise RuntimeError(f"Failed to read EPUB file: {e}")
 
+    # --- STAGE 1: METADATA AND RAW TEXT EXTRACTION ---
     text_content = []
-    title = None
-    author = None
-
+    title, author = None, None
     try:
         title_metadata = book.get_metadata('DC', 'title')
-        if title_metadata:
-            title = title_metadata[0][0]
-            print(f"Extracted title: {title}")
-        else:
-            title = os.path.splitext(os.path.basename(epub_path))[0]
-            print(f"No title in metadata. Using filename: {title}")
-
+        title = title_metadata[0][0] if title_metadata else os.path.splitext(os.path.basename(epub_path))[0]
         author_metadata = book.get_metadata('DC', 'creator')
-        if author_metadata:
-            author = author_metadata[0][0]
-            print(f"Extracted author: {author}")
-        else:
-            author = "Unknown Author"
-            print(f"No author in metadata. Using '{author}'.")
-    except Exception as e:
-        print(f"Error extracting metadata: {e}")
-        if title is None:
-            title = os.path.splitext(os.path.basename(epub_path))[0]
-            print(f"Using filename as title due to error: {title}")
-        if author is None:
-            author = "Unknown Author"
-            print(f"Using '{author}' due to error in metadata extraction.")
+        author = author_metadata[0][0] if author_metadata else "Unknown Author"
+    except (IndexError, AttributeError):
+        if title is None: title = os.path.splitext(os.path.basename(epub_path))[0]
+        if author is None: author = "Unknown Author"
 
-    for spine_item in book.spine:
-        item = book.get_item_with_id(spine_item[0])
-        if item and item.get_type() == ITEM_DOCUMENT:
-            try:
-                soup = BeautifulSoup(item.get_content(), 'html.parser')
-                text = soup.get_text(separator=' ', strip=True)
-                if text:
-                    text_content.append(text)
-            except Exception as e:
-                print(f"Error parsing document item {item.get_id()}: {e}")
+    for item in book.get_items_of_type(ITEM_DOCUMENT):
+        try:
+            soup = BeautifulSoup(item.get_content(), 'html.parser')
+            # Extract text from each chapter/document
+            # Note: The effectiveness of the hyphen fix below depends on newlines being preserved here.
+            # Using ' ' as a separator is generally safe.
+            text_content.append(soup.get_text(separator=' ', strip=True))
+        except Exception as e:
+            print(f"Warning: Error parsing document item {item.get_id()}: {e}")
+    
+    raw_text = ' '.join(text_content)
+    if not raw_text:
+        raise ValueError("No text could be extracted from the EPUB file.")
 
-    full_text = ' '.join(text_content)
-    if not full_text:
-        raise ValueError("No text found in EPUB file.")
-    print(f"Extracted {len(full_text)} characters from EPUB.")
-    return full_text, title, author
+    # --- STAGE 2: PRE-NORMALIZATION CLEANING ---
+    
+    # --- NEW: Fix line-break hyphens ---
+    # This rejoins words that were split across lines, a common artifact in many documents.
+    # It looks for a word character, a hyphen, optional whitespace (including newlines), and another word character.
+    text = re.sub(r'(\w)-\s*(\w)', r'\1\2', raw_text)
+
+    # Remove citations, footnotes, and other non-narrative elements first.
+    text = re.sub(r'\s*\[[^\]]+\]', '', text)  # Use 'text' from now on, not 'raw_text'
+    citation_paren_pattern = r'\s*\((?:[^)]*?\d{4}[^)]*?|[^)]*?et al\.|[^)]*?p\.\s\d+|[^)]*?fig\.[^)]*?)\)'
+    text = re.sub(citation_paren_pattern, '', text) # Remove parenthetical citations
+    text = re.sub(r'(?<=[a-zA-Z.,;"])\d{1,2}\b', '', text)
+
+    # --- STAGE 3: COMPREHENSIVE TEXT NORMALIZATION ---
+
+    # 3a. Handle special characters and symbols
+    replacements = {
+        '—': ', ', '–': ', ', '&': ' and ', '%': ' percent ',
+        '$': ' dollars ', '€': ' euros ', '£': ' pounds ', '¥': ' yen ',
+        '@': ' at ', '#': ' hash tag ', '*': ' asterisk ',
+        'µm': ' micrometers ', 'um': ' micrometers '
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    # 3b. Expand a very large list of abbreviations
+    abbreviations = {
+        # Titles & Ranks
+        "Mr.": "Mister", "Mrs.": "Missus", "Ms.": "Miss", "Dr.": "Doctor",
+        "Prof.": "Professor", "Rev.": "Reverend", "Hon.": "Honorable", "St.": "Saint",
+        "Jr.": "Junior", "Sr.": "Senior", "Gen.": "General", "Adm.": "Admiral",
+        "Capt.": "Captain", "Cmdr.": "Commander", "Lt.": "Lieutenant", "Sgt.": "Sergeant",
+
+        # Business & Legal
+        "Co.": "Company", "Corp.": "Corporation", "Inc.": "Incorporated", "Ltd.": "Limited",
+        "LLC": "Limited Liability Company", "vs.": "versus", "et al.": "et alia",
+
+        # Academic & Latin
+        "etc.": "et cetera", "e.g.": "for example", "i.e.": "that is",
+        "Ph.D.": "Doctor of Philosophy", "M.A.": "Master of Arts", "B.A.": "Bachelor of Arts",
+        "p.": "page", "pp.": "pages", "vol.": "volume", "No.": "Number", "Fig.": "Figure", "Eq.": "Equation",
+
+        # Geographic & Directions
+        "U.S.": "United States", "U.S.A.": "United States of America", "U.K.": "United Kingdom",
+        "E.U.": "European Union", "Ave.": "Avenue", "Blvd.": "Boulevard",
+        "Rd.": "Road", "Dr.": "Drive", "N.": "North", "S.": "South", "E.": "East", "W.": "West",
+
+        # Units of Measurement (Metric)
+        "mm": "millimeters", "cm": "centimeters", "m": "meters", "km": "kilometers",
+        "mg": "milligrams", "g": "grams", "kg": "kilograms",
+
+        # Units of Measurement (Imperial)
+        "in.": "inches", "ft.": "feet", "yd.": "yards", "mi.": "miles",
+        "oz.": "ounces", "lb.": "pounds", "lbs.": "pounds",
+
+        # Units of Measurement (Other)
+        "mph": "miles per hour", "kph": "kilometers per hour", "sq.": "square", "cu.": "cubic",
+        "deg.": "degrees",
+
+        # Time & Dates
+        "sec.": "second", "min.": "minute", "hr.": "hour", "A.M.": "ay em", "P.M.": "pee em",
+        "Jan.": "January", "Feb.": "February", "Mar.": "March", "Apr.": "April",
+        "Jun.": "June", "Jul.": "July", "Aug.": "August", "Sep.": "September",
+        "Oct.": "October", "Nov.": "November", "Dec.": "December",
+
+        # Miscellaneous
+        "approx.": "approximately", "dept.": "department", "apt.": "apartment", "est.": "established"
+    }
+    for abbr, full_text_version in abbreviations.items():
+        text = re.sub(r'\b' + re.escape(abbr) + r'(?!\w)', full_text_version, text, flags=re.IGNORECASE)
+
+    # 3c. Convert all numbers, ordinals, and years to words
+    def convert_numbers_to_words(text_to_convert):
+        text_to_convert = re.sub(r'\b(1[0-9]{3}|20[0-2][0-9])\b',
+                                 lambda m: num2words(int(m.group(0)), to='year'),
+                                 text_to_convert)
+        text_to_convert = re.sub(r'(\d+)(st|nd|rd|th)\b',
+                                 lambda m: num2words(int(m.group(1)), to='ordinal'),
+                                 text_to_convert,
+                                 flags=re.IGNORECASE)
+        text_to_convert = re.sub(r'\b\d{1,3}(,\d{3})*\b',
+                                 lambda m: num2words(int(m.group(0).replace(',', ''))),
+                                 text_to_convert)
+        return text_to_convert
+
+    cleaned_text = convert_numbers_to_words(text)
+
+    # --- STAGE 4: FINAL CLEANUP ---
+    
+    # --- UPDATED: Robustly normalize all forms of ellipses ---
+    # This handles the single unicode character '…', multiple dots '...', and spaced dots '. . .'
+    cleaned_text = cleaned_text.replace('…', '.') 
+    cleaned_text = re.sub(r'(\s*\.\s*){2,}', '. ', cleaned_text) # Replaces '..', '. . .', etc. with a single period and a space.
+
+    # Remove any extra whitespace introduced during all the processing.
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+
+    print(f"Text cleaned and normalized. Original length: {len(raw_text)}, Final length: {len(cleaned_text)}")
+    
+    return cleaned_text, title, author
 
 def convert_to_epub(input_path, output_path):
     try:
@@ -328,7 +418,7 @@ def show_converted_audiobooks():
     return files
 
 @gpu_decorator
-def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, show_info=gr.Info, progress=gr.Progress(),
+def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, show_info=silent_info, progress=gr.Progress(),
           progress_start_fraction=0.0, progress_end_fraction=1.0, ebook_idx=0, num_ebooks=1):
     try:
         ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=show_info)
@@ -410,17 +500,80 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
             ensure_directory(temp_chunks_dir)
             chunk_file_paths = []
 
-            print("Tokenizing text into sentences for stable chunking...")
-            sentences = sent_tokenize(gen_text)
-            SENTENCES_PER_CHUNK = 75
-            text_super_chunks = [' '.join(sentences[i:i + SENTENCES_PER_CHUNK]) for i in range(0, len(sentences), SENTENCES_PER_CHUNK)]
+            # --- CORRECTED AND IMPROVED TEXT CHUNKING LOGIC ---
+            print("Tokenizing text and building optimized chunks for TTS stability...")
+
+            # Step 1: Get all sentences from the book text.
+            initial_sentences = sent_tokenize(gen_text)
+            
+            # Step 2: Define a maximum safe length for a single phrase/clause before it's split.
+            # This helps break down extremely long, run-on sentences. 250 is a good default.
+            MAX_PHRASE_LENGTH = 200
+            
+            # Step 3: Define the absolute maximum character length for a chunk sent to the TTS model.
+            # This is the most important value to control. Start with a value around 2500.
+            # If you still get hallucinations, lower this value.
+            MAX_CHUNK_LENGTH_CHARS = 200
+
+            # --- Split long sentences into smaller, more manageable phrases ---
+            intermediate_phrases = []
+            for sentence in initial_sentences:
+                if len(sentence) <= MAX_PHRASE_LENGTH:
+                    intermediate_phrases.append(sentence)
+                else:
+                    # Logic to split sentences that are too long at natural breaks
+                    current_part = sentence
+                    while len(current_part) > MAX_PHRASE_LENGTH:
+                        split_pos = -1
+                        delimiters = [',', ';', '—', '–']
+                        for delimiter in delimiters:
+                            pos = current_part.rfind(delimiter, 0, MAX_PHRASE_LENGTH)
+                            if pos > split_pos:
+                                split_pos = pos
+
+                        if split_pos == -1:
+                            split_pos = current_part.rfind(' ', 0, MAX_PHRASE_LENGTH)
+                        
+                        if split_pos == -1:
+                            split_pos = MAX_PHRASE_LENGTH
+
+                        intermediate_phrases.append(current_part[:split_pos+1].strip())
+                        current_part = current_part[split_pos+1:].strip()
+                        
+                    if current_part:
+                        intermediate_phrases.append(current_part)
+
+            # --- Group the phrases into final chunks based on MAX_CHUNK_LENGTH_CHARS ---
+            text_super_chunks = []
+            current_chunk = ""
+            for phrase in intermediate_phrases:
+                # Check if adding the next phrase would exceed the max chunk length
+                if len(current_chunk) + len(phrase) + 1 > MAX_CHUNK_LENGTH_CHARS:
+                    # If the current chunk is not empty, finalize it
+                    if current_chunk:
+                        text_super_chunks.append(current_chunk)
+                    # Start a new chunk with the current phrase
+                    current_chunk = phrase
+                else:
+                    # Add the phrase to the current chunk
+                    if current_chunk:
+                        current_chunk += " " + phrase
+                    else:
+                        current_chunk = phrase
+            
+            # Add the last remaining chunk to the list
+            if current_chunk:
+                text_super_chunks.append(current_chunk)
+
             num_super_chunks = len(text_super_chunks)
+
+            # --- END OF CORRECTED CHUNKING LOGIC ---
 
             if num_super_chunks == 0:
                 print(f"Error: No text chunks could be created from {ebook_title}. Skipping.")
                 continue
 
-            print(f"Book text split into {num_super_chunks} sentence-based super-chunks for processing.")
+            print(f"Book text split into {num_super_chunks} super-chunks for processing.")
 
             ebook_start_time = time.time()
             progress_updater = EbookProgressUpdater(
@@ -445,7 +598,7 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
                     try:
                         audio_out_chunk, _ = infer(
                             ref_audio_input, ref_text, text_chunk,
-                            cross_fade_duration, speed, show_info=gr.Info,
+                            cross_fade_duration, speed, show_info=silent_info,
                             progress=progress_updater,
                             ebook_idx=idx, num_ebooks=num_ebooks,
                             progress_start_fraction=chunk_progress_start,
