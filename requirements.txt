@@ -79,6 +79,7 @@ networkx==3.4.2
 nltk==3.9.1
 numba==0.60.0
 numpy==1.26.4
+num2words==0.5.13
 nvidia-cublas-cu12==12.4.5.8
 nvidia-cuda-cupti-cu12==12.4.127
 nvidia-cuda-nvrtc-cu12==12.4.127
