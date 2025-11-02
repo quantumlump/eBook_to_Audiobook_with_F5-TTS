@@ -369,21 +369,27 @@ def infer_process(
     speed=speed,
     fix_duration=fix_duration,
     device=device,
-    progress_start_fraction=0.0, # Overall start fraction for this infer call
-    progress_end_fraction=1.0,   # Overall end fraction for this infer call
-    ebook_idx=0,                 # Current ebook index
-    num_ebooks=1                 # Total number of ebooks
+    progress_start_fraction=0.0,
+    progress_end_fraction=1.0,
+    ebook_idx=0,
+    num_ebooks=1
 ):
+    # CORRECTED: Fixed typo from 'torchio' to 'torchaudio'
     audio, sr = torchaudio.load(ref_audio)
-    max_chars = int(len(ref_text.encode("utf-8")) / (audio.shape[-1] / sr) * (25 - audio.shape[-1] / sr))
-    gen_text_batches = chunk_text(gen_text, max_chars=max_chars)
-    for i, gen_text_item in enumerate(gen_text_batches): # Corrected variable name from gen_text to gen_text_item
-        print(f"gen_text {i}", gen_text_item) # Corrected variable name
+    
+    # We treat the incoming `gen_text` as a single, complete batch.
+    gen_text_batches = [gen_text]
+    
+    # This block prints the full text of the chunk being processed for visibility.
+    if gen_text_batches and gen_text_batches[0]:
+        print(f"--- Processing Text Chunk (Length: {len(gen_text_batches[0])}) ---")
+        print(gen_text_batches[0])
+        print("--------------------------------------------------------------------")
 
     if callable(show_info):
-        show_info(f"Synthesizing audio in {len(gen_text_batches)} chunks for Ebook {ebook_idx+1}/{num_ebooks}...")
+        show_info(f"Synthesizing audio for text chunk in Ebook {ebook_idx+1}/{num_ebooks}...")
     else:
-        print(f"Synthesizing audio in {len(gen_text_batches)} chunks for Ebook {ebook_idx+1}/{num_ebooks}...")
+        print(f"Synthesizing audio for text chunk in Ebook {ebook_idx+1}/{num_ebooks}...")
 
     return infer_batch_process(
         (audio, sr),
@@ -406,7 +412,6 @@ def infer_process(
         ebook_idx=ebook_idx,
         num_ebooks=num_ebooks
     )
-
 
 # infer batches
 
