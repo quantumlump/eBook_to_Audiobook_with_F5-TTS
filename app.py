@@ -8,6 +8,7 @@ import time
 from collections import OrderedDict
 from importlib.resources import files
 from num2words import num2words
+from decimal import Decimal, InvalidOperation
 
 import click
 import gradio as gr
@@ -242,146 +243,189 @@ def embed_metadata_into_mp3(mp3_path, cover_image_path, title, author, album_tit
     except Exception as e:
         print(f"Failed to save MP3 metadata: {e}")
 
+
+def strip_footnotes(text: str) -> str:
+    """
+    Removes various footnote and citation formats from text with comprehensive
+    rules for academic, scientific, and measurement-based parentheticals.
+    This version corrects a bug that incorrectly stripped decimal points.
+    """
+    # 1. Asterisk-based footnote markers
+    text = re.sub(r'\*\s*\d+\b', '', text)
+
+    # 2. Orphaned numeric footnotes
+    text = re.sub(r'^\s*\d+\b', '', text) # At the start of a chunk
+    text = re.sub(r'(\.\s+)\d+\b', r'\1', text) # After a period and space
+
+    # 2a. CORRECTED: Handles footnotes like "word.48" without affecting decimals like "8.8"
+    #     It replaces a period followed by numbers with just the period, but only if a letter precedes it.
+    text = re.sub(r'(?<=[a-zA-Z])\.\d+\b', '.', text)
+    
+    # 2b. CORRECTED: Handles footnotes after other punctuation like "word?48"
+    text = re.sub(r'(?<=[?!])\d+\b', '', text)
+
+
+    # --- PARENTHETICAL REMOVALS (ORDERED FROM MORE SPECIFIC TO MORE GENERAL) ---
+
+    # 3. Comprehensive rule for academic/scientific parentheticals (year or keyword-based)
+    academic_terms = r'\b(?:spp?\.?|ssp\.?|subsp\.?|var\.?|f\.?|cf\.?|e\.g\.?|i\.e\.?|viz\.?|see|fig\.?|plate|chapter|probably)\b'
+    year_pattern = r'\d{4}'
+    combined_pattern = rf'\([^)]*(?:{academic_terms}|{year_pattern})[^)]*\)'
+    text = re.sub(combined_pattern, '', text, flags=re.IGNORECASE)
+
+    # 4. Rule for scientific names in the format (Genus species)
+    scientific_name_pattern = r'\(\s*[A-Z][a-z]+ [a-z]+\s*\)'
+    text = re.sub(scientific_name_pattern, '', text)
+
+    # 5. Rule for measurement clarifications, e.g., (2 tablespoons)
+    measurement_units = r'(?:tablespoons?|teaspoons?|ml|millilitres?|l|litres?|g|grams?|kg|kilograms?|oz|ounces?|lb|pounds?|in|inch|inches|ft|feet|cm|centimetres?|m|metres?)\b'
+    measurement_pattern = rf'\(\s*\d+\s*{measurement_units}\s*\)'
+    text = re.sub(measurement_pattern, '', text, flags=re.IGNORECASE)
+
+    # 6. Removes parenthetical asides used for clarification, like "(or...)"
+    text = re.sub(r'\([^)]*\sor\s[^)]*\)', '', text, flags=re.IGNORECASE)
+
+    # 7. Parentheses that contain only letters (e.g., "(nine)", "(Halkomelem)")
+    text = re.sub(r'\(\s*[A-Za-z]+(?:\s+[A-Za-z]+)*\s*\)', '', text)
+
+    # 8. Parentheses that contain only digits (e.g., "(3)")
+    text = re.sub(r'\(\s*\d+\s*\)', '', text)
+
+    # 9. Bracketed citations – e.g., [1], [sic]
+    text = re.sub(r'\[[^\]]*\]', '', text)
+
+    # Collapse any double-spaces that may have been left behind and strip ends
+    return re.sub(r'\s{2,}', ' ', text).strip()
+
+
 def extract_text_and_title_from_epub(epub_path):
     """
-    Extracts and meticulously cleans text from an EPUB file for high-quality TTS.
-    This includes metadata extraction, citation removal, and extensive text normalization.
+    Extracts and meticulously cleans text from an EPUB file for high‑quality TTS.
+    The footnote/citation stripping logic has been updated to correctly
+    remove any parenthetical markers, and number conversion now correctly
+    handles decimals.
     """
+    # ------------------------------------------------------------------
+    # 1.  METADATA & RAW TEXT EXTRACTION
+    # ------------------------------------------------------------------
     try:
         book = epub.read_epub(epub_path)
     except Exception as e:
         raise RuntimeError(f"Failed to read EPUB file: {e}")
 
-    # --- STAGE 1: METADATA AND RAW TEXT EXTRACTION ---
     text_content = []
-    title, author = None, None
+    title, authors = None, None
     try:
+        # Title
         title_metadata = book.get_metadata('DC', 'title')
         title = title_metadata[0][0] if title_metadata else os.path.splitext(os.path.basename(epub_path))[0]
-        author_metadata = book.get_metadata('DC', 'creator')
-        author = author_metadata[0][0] if author_metadata else "Unknown Author"
-    except (IndexError, AttributeError):
-        if title is None: title = os.path.splitext(os.path.basename(epub_path))[0]
-        if author is None: author = "Unknown Author"
 
+        # Author(s)
+        author_metadata = book.get_metadata('DC', 'creator')
+        authors = author_metadata[0][0] if author_metadata else "Unknown Author"
+    except (IndexError, AttributeError):
+        title = os.path.splitext(os.path.basename(epub_path))[0]
+        authors = "Unknown Author"
+
+    # Grab all the XHTML/HTML documents in the book
     for item in book.get_items_of_type(ITEM_DOCUMENT):
         try:
             soup = BeautifulSoup(item.get_content(), 'html.parser')
-            # Extract text from each chapter/document
-            # Note: The effectiveness of the hyphen fix below depends on newlines being preserved here.
-            # Using ' ' as a separator is generally safe.
             text_content.append(soup.get_text(separator=' ', strip=True))
         except Exception as e:
             print(f"Warning: Error parsing document item {item.get_id()}: {e}")
-    
+
     raw_text = ' '.join(text_content)
     if not raw_text:
         raise ValueError("No text could be extracted from the EPUB file.")
 
-    # --- STAGE 2: PRE-NORMALIZATION CLEANING ---
-    
-    # --- NEW: Fix line-break hyphens ---
-    # This rejoins words that were split across lines, a common artifact in many documents.
-    # It looks for a word character, a hyphen, optional whitespace (including newlines), and another word character.
-    text = re.sub(r'(\w)-\s*(\w)', r'\1\2', raw_text)
+    # Call the corrected stripping function first
+    text = strip_footnotes(raw_text)
 
-    # Remove citations, footnotes, and other non-narrative elements first.
-    text = re.sub(r'\s*\[[^\]]+\]', '', text)  # Use 'text' from now on, not 'raw_text'
-    citation_paren_pattern = r'\s*\((?:[^)]*?\d{4}[^)]*?|[^)]*?et al\.|[^)]*?p\.\s\d+|[^)]*?fig\.[^)]*?)\)'
-    text = re.sub(citation_paren_pattern, '', text) # Remove parenthetical citations
-    text = re.sub(r'(?<=[a-zA-Z.,;"])\d{1,2}\b', '', text)
-    
-    # --- FIX: Remove asterisk-based citations and markers (*, **, *1, *2, etc.) ---
-    text = re.sub(r'\*+\d*\b', '', text)
-
-    # --- STAGE 3: COMPREHENSIVE TEXT NORMALIZATION ---
-
-    # 3a. Handle special characters and symbols
+    # ------------------------------------------------------------------
+    # 2.  COMPREHENSIVE TEXT NORMALIZATION
+    # ------------------------------------------------------------------
     replacements = {
-        '—': ', ', '–': ', ', '&': ' and ', '%': ' percent ',
+        '—': ', ', '–': ', ',
+        '&': ' and ', '%': ' percent ',
         '$': ' dollars ', '€': ' euros ', '£': ' pounds ', '¥': ' yen ',
-        '@': ' at ', '#': ' hash tag ',
-        # --- FIX: Removed the rule that converted '*' to 'asterisk' ---
-        'µm': ' micrometers ',
+        '@': ' at ', '#': ' hash tag ', 'µm': ' micrometers ',
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
+    text = text.replace('"', ' ').replace('“', ' ').replace('”', ' ')
 
-    # 3b. Expand a very large list of abbreviations
-    abbreviations = {
-        # Titles & Ranks
+    # ------------------------------------------------------------------
+    # 3.  ABBREVIATION HANDLING
+    # ------------------------------------------------------------------
+    safe_abbreviations = {
         "Mr.": "Mister", "Mrs.": "Missus", "Ms.": "Miss", "Dr.": "Doctor",
-        "Prof.": "Professor", "Rev.": "Reverend", "Hon.": "Honorable", "St.": "Saint",
+        "Prof.": "Professor", "Rev.": "Reverend", "Hon.": "Honorable",
         "Jr.": "Junior", "Sr.": "Senior", "Gen.": "General", "Adm.": "Admiral",
-        "Capt.": "Captain", "Cmdr.": "Commander", "Lt.": "Lieutenant", "Sgt.": "Sergeant",
-
-        # Business & Legal
-        "Co.": "Company", "Corp.": "Corporation", "Inc.": "Incorporated", "Ltd.": "Limited",
-        "LLC": "Limited Liability Company", "vs.": "versus", "et al.": "et alia",
-
-        # Academic & Latin
-        "etc.": "et cetera", "e.g.": "for example", "i.e.": "that is",
-        "Ph.D.": "Doctor of Philosophy", "M.A.": "Master of Arts", "B.A.": "Bachelor of Arts",
-        "p.": "page", "pp.": "pages", "vol.": "volume", "No.": "Number", "Fig.": "Figure", "Eq.": "Equation",
-
-        # Geographic & Directions
-        "U.S.": "United States", "U.S.A.": "United States of America", "U.K.": "United Kingdom",
-        "E.U.": "European Union", "Ave.": "Avenue", "Blvd.": "Boulevard",
-        "Rd.": "Road", "Dr.": "Drive", "N.": "North", "S.": "South", "E.": "East", "W.": "West",
-
-        # Units of Measurement (Metric)
-        "mm": "millimeters", "cm": "centimeters", "m": "meters", "km": "kilometers",
-        "mg": "milligrams", "g": "grams", "kg": "kilograms",
-
-        # Units of Measurement (Imperial)
-        "in.": "inches", "ft.": "feet", "yd.": "yards", "mi.": "miles",
-        "oz.": "ounces", "lb.": "pounds", "lbs.": "pounds",
-
-        # Units of Measurement (Other)
-        "mph": "miles per hour", "kph": "kilometers per hour", "sq.": "square", "cu.": "cubic",
-        "deg.": "degrees",
-
-        # Time & Dates
-        "sec.": "second", "min.": "minute", "hr.": "hour", "A.M.": "ay em", "P.M.": "pee em",
+        "Capt.": "Captain", "Cmdr.": "Commander", "Lt.": "Lieutenant",
+        "Sgt.": "Sergeant", "Co.": "Company", "Corp.": "Corporation",
+        "Inc.": "Incorporated", "Ltd.": "Limited", "LLC": "Limited Liability Company",
+        "vs.": "versus", "et al.": "et alia", "etc.": "et cetera",
+        "e.g.": "for example", "i.e.": "that is", "Ph.D.": "Doctor of Philosophy",
+        "M.A.": "Master of Arts", "B.A.": "Bachelor of Arts", "pp.": "pages",
+        "vol.": "volume", "No.": "Number", "Fig.": "Figure", "Eq.": "Equation",
+        "U.S.": "United States", "U.S.A.": "United States of America",
+        "U.K.": "United Kingdom", "E.U.": "European Union", "Ave.": "Avenue",
+        "Blvd.": "Boulevard", "Rd.": "Road", "Dr.": "Drive", "mm": "millimeters",
+        "cm": "centimeters", "m": "meters", "km": "kilometers", "mg": "milligrams",
+        "g": "grams", "kg": "kilograms", "in.": "inches", "ft.": "feet",
+        "yd.": "yards", "mi.": "miles", "oz.": "ounces", "lb.": "pounds",
+        "lbs.": "pounds", "mph": "miles per hour", "kph": "kilometers per hour",
+        "sq.": "square", "cu.": "cubic", "deg.": "degrees", "sec.": "second",
+        "min.": "minute", "hr.": "hour", "A.M.": "ay em", "P.M.": "pee em",
         "Jan.": "January", "Feb.": "February", "Mar.": "March", "Apr.": "April",
         "Jun.": "June", "Jul.": "July", "Aug.": "August", "Sep.": "September",
         "Oct.": "October", "Nov.": "November", "Dec.": "December",
-
-        # Miscellaneous
-        "approx.": "approximately", "dept.": "department", "apt.": "apartment", "est.": "established"
+        "approx.": "approximately", "dept.": "department", "apt.": "apartment",
+        "est.": "established"
     }
-    for abbr, full_text_version in abbreviations.items():
-        text = re.sub(r'\b' + re.escape(abbr) + r'(?!\w)', full_text_version, text, flags=re.IGNORECASE)
+    for abbr, full in safe_abbreviations.items():
+        text = re.sub(r'\b' + re.escape(abbr) + r'(?!\w)', full, text, flags=re.IGNORECASE)
 
-    # 3c. Convert all numbers, ordinals, and years to words
-    def convert_numbers_to_words(text_to_convert):
-        text_to_convert = re.sub(r'\b(1[0-9]{3}|20[0-2][0-9])\b',
-                                 lambda m: num2words(int(m.group(0)), to='year'),
-                                 text_to_convert)
-        text_to_convert = re.sub(r'(\d+)(st|nd|rd|th)\b',
-                                 lambda m: num2words(int(m.group(1)), to='ordinal'),
-                                 text_to_convert,
-                                 flags=re.IGNORECASE)
-        text_to_convert = re.sub(r'\b\d{1,3}(,\d{3})*\b',
-                                 lambda m: num2words(int(m.group(0).replace(',', ''))),
-                                 text_to_convert)
-        return text_to_convert
+    problematic_abbreviations = {
+        "N.": "North", "S.": "South", "E.": "East", "W.": "West",
+        "p.": "page", "St.": "Saint"
+    }
+    for abbr, full in problematic_abbreviations.items():
+        pattern = r'(^|\s)' + re.escape(abbr) + r'(?!\w)'
+        repl = r'\1' + full
+        text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+
+    # ------------------------------------------------------------------
+    # 4.  NUMBER‑TO‑WORD CONVERSION
+    # ------------------------------------------------------------------
+    def convert_numbers_to_words(txt):
+        txt = re.sub(r'\b(1[0-9]{3}|20[0-9]{2})\b',
+                     lambda m: num2words(int(m.group(0)), to='year'), txt)
+        txt = re.sub(r'(\d+)(st|nd|rd|th)\b',
+                     lambda m: num2words(int(m.group(1)), to='ordinal'), txt, flags=re.IGNORECASE)
+
+        def number_replacer(match):
+            num_str = match.group(0).replace(',', '')
+            return num2words(Decimal(num_str))
+
+        number_pattern = r'\b\d{1,3}(?:,\d{3})*\.\d+\b|\b\d{1,3}(?:,\d{3})*\b'
+        txt = re.sub(number_pattern, number_replacer, txt)
+        return txt
 
     cleaned_text = convert_numbers_to_words(text)
 
-    # --- STAGE 4: FINAL CLEANUP ---
-    
-    # --- UPDATED: Robustly normalize all forms of ellipses ---
-    # This handles the single unicode character '…', multiple dots '...', and spaced dots '. . .'
-    cleaned_text = cleaned_text.replace('…', '.') 
-    cleaned_text = re.sub(r'(\s*\.\s*){2,}', '. ', cleaned_text) # Replaces '..', '. . .', etc. with a single period and a space.
-
-    # Remove any extra whitespace introduced during all the processing.
+    # ------------------------------------------------------------------
+    # 5.  FINAL CLEANUP
+    # ------------------------------------------------------------------
+    cleaned_text = cleaned_text.replace('…', '.')
+    cleaned_text = re.sub(r'(\s*\.\s*){2,}', '. ', cleaned_text)
     cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
 
     print(f"Text cleaned and normalized. Original length: {len(raw_text)}, Final length: {len(cleaned_text)}")
-    
-    return cleaned_text, title, author
+
+    return cleaned_text, title, authors
+
 
 def convert_to_epub(input_path, output_path):
     try:
@@ -430,6 +474,7 @@ def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, 
         raise RuntimeError(f"Error in preprocessing reference audio and text: {e}")
     if not gen_text.strip():
         raise ValueError("Generated text is empty. Please provide valid text content.")
+
     try:
         with torch.no_grad():
             final_wave, final_sample_rate, _ = infer_process(
@@ -442,6 +487,7 @@ def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, 
             )
     except Exception as e:
         raise RuntimeError(f"Error during inference process: {e}")
+    
     print(f"Generated audio length: {len(final_wave)} samples at {final_sample_rate} Hz.")
     return (final_sample_rate, final_wave), ref_text
 
@@ -723,7 +769,7 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
         raise gr.Error(f"An error occurred: {str(e)}")
 
 DEFAULT_REF_AUDIO_PATH = "/app/default_voice.mp3"
-DEFAULT_REF_TEXT = "For thirty-six years I was the confidential secretary of the Roman statesman Cicero. At first this was exciting, then astonishing, then arduous, and finally extremely dangerous."
+DEFAULT_REF_TEXT = "The birch canoe slid on the smooth planks. Glue the sheet to the dark blue background. It's easy to tell the depth of a well. The juice of lemons makes fine punch."
 
 def create_gradio_app():
     """Create and configure the Gradio application."""
