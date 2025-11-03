@@ -168,4 +168,4 @@ COPY app.py .
 
 # Set ENTRYPOINT and CMD
 ENTRYPOINT ["python", "app.py"]
-CMD []s
+CMD []
