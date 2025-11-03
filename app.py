@@ -290,6 +290,9 @@ def extract_text_and_title_from_epub(epub_path):
     citation_paren_pattern = r'\s*\((?:[^)]*?\d{4}[^)]*?|[^)]*?et al\.|[^)]*?p\.\s\d+|[^)]*?fig\.[^)]*?)\)'
     text = re.sub(citation_paren_pattern, '', text) # Remove parenthetical citations
     text = re.sub(r'(?<=[a-zA-Z.,;"])\d{1,2}\b', '', text)
+    
+    # --- FIX: Remove asterisk-based citations and markers (*, **, *1, *2, etc.) ---
+    text = re.sub(r'\*+\d*\b', '', text)
 
     # --- STAGE 3: COMPREHENSIVE TEXT NORMALIZATION ---
 
@@ -297,8 +300,9 @@ def extract_text_and_title_from_epub(epub_path):
     replacements = {
         '—': ', ', '–': ', ', '&': ' and ', '%': ' percent ',
         '$': ' dollars ', '€': ' euros ', '£': ' pounds ', '¥': ' yen ',
-        '@': ' at ', '#': ' hash tag ', '*': ' asterisk ',
-        'µm': ' micrometers ', 'um': ' micrometers '
+        '@': ' at ', '#': ' hash tag ',
+        # --- FIX: Removed the rule that converted '*' to 'asterisk' ---
+        'µm': ' micrometers ',
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
