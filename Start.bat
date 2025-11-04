@@ -48,7 +48,7 @@ cd /d "%~dp0"
 echo Checking for local Docker image: %IMAGE_NAME%
 docker image inspect %IMAGE_NAME% >nul 2>nul
 IF %ERRORLEVEL% NEQ 0 (
-  echo Image not found locally. Loading from %TAR_FILE%... This may take a while.
+  echo Image not found locally. Loading from %TAR_FILE%... This may take over 20 min.
   docker load -i %TAR_FILE%
 ) ELSE (
   echo Image already exists locally. Skipping load.
