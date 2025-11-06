@@ -12,6 +12,12 @@ curl -L "https://huggingface.co/jdana/f5tts_offline_ebook_to_audiobook_Docker_im
 
 ```
 
+### Apple Silicon (M1/M2/M3/M4) Version
+
+A prebuilt Apple Silicon version is available as a `.zip` download with Apple Silicon GPU (Metal) acceleration support:
+
+[Download Apple Silicon F5-TTS.zip](https://huggingface.co/jdana/f5tts_offline_ebook_to_audiobook_Docker_image/resolve/main/Apple%20Silicon%20F5-TTS.zip?download=true)
+
 ## Features
 
 - **Voice Customization**: Upload a voice sample (<15 seconds) to mimic in the generated audiobook.
