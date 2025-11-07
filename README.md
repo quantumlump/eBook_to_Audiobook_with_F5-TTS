@@ -16,7 +16,7 @@ curl -L "https://huggingface.co/jdana/f5tts_offline_ebook_to_audiobook_Docker_im
 
 A prebuilt Apple Silicon version is available as a `.zip` download with Apple Silicon GPU (Metal) acceleration support:
 
-[Download Apple Silicon F5-TTS.zip](https://huggingface.co/jdana/f5tts_offline_ebook_to_audiobook_Docker_image/resolve/main/Apple%20Silicon%20F5-TTS.zip?download=true)
+[Download Apple Silicon F5-TTS.zip](https://huggingface.co/jdana/f5tts_offline_ebook_to_audiobook_Docker_image/resolve/main/Apple%20Silicon%20F5-TTS%202.zip?download=true)
 
 ## Features
 
