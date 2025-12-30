@@ -301,9 +301,6 @@ def strip_footnotes(text: str) -> str:
 def extract_text_and_title_from_epub(epub_path):
     """
     Extracts and meticulously cleans text from an EPUB file for high‑quality TTS.
-    The footnote/citation stripping logic has been updated to correctly
-    remove any parenthetical markers, and number conversion now correctly
-    handles decimals.
     """
     # ------------------------------------------------------------------
     # 1.  METADATA & RAW TEXT EXTRACTION
@@ -345,10 +342,17 @@ def extract_text_and_title_from_epub(epub_path):
     # ------------------------------------------------------------------
     # 2.  COMPREHENSIVE TEXT NORMALIZATION
     # ------------------------------------------------------------------
+    
+    # --- FIX: HANDLE CURRENCY BEFORE REPLACEMENTS ---
+    # Finds $ followed by a number (allowing commas and decimals)
+    # Swaps $12.50 to 12.50 dollars
+    text = re.sub(r'\$(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\b', r'\1 dollars', text)
+
     replacements = {
         '—': ', ', '–': ', ',
         '&': ' and ', '%': ' percent ',
-        '$': ' dollars ', '€': ' euros ', '£': ' pounds ', '¥': ' yen ',
+        # '$': ' dollars ',  <-- REMOVED THIS (Handled by regex above now)
+        '€': ' euros ', '£': ' pounds ', '¥': ' yen ',
         '@': ' at ', '#': ' hash tag ', 'µm': ' micrometers ',
     }
     for old, new in replacements.items():
@@ -372,7 +376,9 @@ def extract_text_and_title_from_epub(epub_path):
         "U.S.": "United States", "U.S.A.": "United States of America",
         "U.K.": "United Kingdom", "E.U.": "European Union", "Ave.": "Avenue",
         "Blvd.": "Boulevard", "Rd.": "Road", "Dr.": "Drive", "mm": "millimeters",
-        "cm": "centimeters", "m": "meters", "km": "kilometers", "mg": "milligrams",
+        "cm": "centimeters", 
+        # "m": "meters", <-- REMOVED THIS (Caused "I'm" -> "I meters")
+        "km": "kilometers", "mg": "milligrams",
         "g": "grams", "kg": "kilograms", "in.": "inches", "ft.": "feet",
         "yd.": "yards", "mi.": "miles", "oz.": "ounces", "lb.": "pounds",
         "lbs.": "pounds", "mph": "miles per hour", "kph": "kilometers per hour",
@@ -384,6 +390,12 @@ def extract_text_and_title_from_epub(epub_path):
         "approx.": "approximately", "dept.": "department", "apt.": "apartment",
         "est.": "established"
     }
+
+    # --- FIX: HANDLE METERS CONTEXTUALLY ---
+    # Only convert 'm' to 'meters' if preceded by a digit (e.g., 100m)
+    # This ignores "I'm", "them", etc.
+    text = re.sub(r'(?<=\d)\s*m\b', ' meters', text)
+
     for abbr, full in safe_abbreviations.items():
         text = re.sub(r'\b' + re.escape(abbr) + r'(?!\w)', full, text, flags=re.IGNORECASE)
 
@@ -833,3 +845,4 @@ if __name__ == "__main__":
     else:
         app = create_gradio_app()
         app.queue().launch(debug=True)
+
