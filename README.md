@@ -1,6 +1,7 @@
 # Easy eBook to Audiobook Converter with F5-TTS
 
-![image](https://github.com/user-attachments/assets/d286b6e4-7a73-4e9d-88af-dc910652d743)
+![Screenshot 2025-12-30 at 5 56 10 PM](https://github.com/user-attachments/assets/85da5017-3e2a-4556-a4b9-01b00bf8162e)
+
 
 
 Turn your eBooks into audiobooks using the F5-TTS text-to-speech model. This application allows you to upload an eBook file and a reference voice sample to generate a personalized audiobook. The app supports various eBook formats and provides advanced settings to customize the output.
