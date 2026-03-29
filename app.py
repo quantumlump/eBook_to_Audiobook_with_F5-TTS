@@ -160,36 +160,6 @@ def load_f5tts(ckpt_path=None):
 
 F5TTS_ema_model = load_f5tts()
 
-chat_model_state = None
-chat_tokenizer_state = None
-
-@gpu_decorator
-def generate_response(messages, model, tokenizer):
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    model_inputs = tokenizer([text], return_tensors="pt").to(device)
-    max_new_tokens = 1000000
-    with torch.no_grad():
-        generated_ids = model.generate(
-            input_ids=model_inputs.input_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=0.5,
-            top_p=0.9,
-            do_sample=True,
-            repetition_penalty=1.2,
-        )
-    if not generated_ids:
-        raise ValueError("No generated IDs returned by the model.")
-    generated_ids = [
-        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-    ]
-    if not generated_ids or not generated_ids[0]:
-        raise ValueError("Generated IDs are empty after processing.")
-    return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-
 def extract_metadata_and_cover(ebook_path):
     try:
         cover_path = os.path.splitext(ebook_path)[0] + '.jpg'
@@ -240,6 +210,7 @@ def embed_metadata_into_mp3(mp3_path, cover_image_path, title, author, album_tit
     try:
         audio.save(mp3_path, v2_version=3)
         print(f"Successfully saved metadata to {mp3_path}")
+        del audio 
     except Exception as e:
         print(f"Failed to save MP3 metadata: {e}")
 
@@ -310,7 +281,7 @@ def extract_text_and_title_from_epub(epub_path):
     except Exception as e:
         raise RuntimeError(f"Failed to read EPUB file: {e}")
 
-    text_content = []
+    text_content =[]
     title, authors = None, None
     try:
         # Title
@@ -329,6 +300,7 @@ def extract_text_and_title_from_epub(epub_path):
         try:
             soup = BeautifulSoup(item.get_content(), 'html.parser')
             text_content.append(soup.get_text(separator=' ', strip=True))
+            soup.decompose() 
         except Exception as e:
             print(f"Warning: Error parsing document item {item.get_id()}: {e}")
 
@@ -343,16 +315,23 @@ def extract_text_and_title_from_epub(epub_path):
     # 2.  COMPREHENSIVE TEXT NORMALIZATION
     # ------------------------------------------------------------------
     
-    # --- FIX: HANDLE CURRENCY BEFORE REPLACEMENTS ---
-    # Finds $ followed by a number (allowing commas and decimals)
-    # Swaps $12.50 to 12.50 dollars
-    text = re.sub(r'\$(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\b', r'\1 dollars', text)
+    # --- FIX 1: ROBUST CURRENCY HANDLING ---
+    # Finds currency symbol followed by a number (allowing commas, decimals, and magnitude words)
+    # Swaps $12.50 to 12.50 dollars, £50 million to 50 million pounds
+    currency_map = {
+        r'\$': 'dollars',
+        r'£': 'pounds',
+        r'€': 'euros',
+        r'¥': 'yen'
+    }
+    for symbol, name in currency_map.items():
+        pattern = rf'{symbol}(\d{{1,3}}(?:,\d{{3}})*(?:\.\d+)?(?:\s*(?:million|billion|trillion))?)\b'
+        text = re.sub(pattern, rf'\1 {name}', text, flags=re.IGNORECASE)
 
+    # Note: € £ ¥ are removed from here as they are now handled safely above
     replacements = {
         '—': ', ', '–': ', ',
         '&': ' and ', '%': ' percent ',
-        # '$': ' dollars ',  <-- REMOVED THIS (Handled by regex above now)
-        '€': ' euros ', '£': ' pounds ', '¥': ' yen ',
         '@': ' at ', '#': ' hash tag ', 'µm': ' micrometers ',
     }
     for old, new in replacements.items():
@@ -362,8 +341,10 @@ def extract_text_and_title_from_epub(epub_path):
     # ------------------------------------------------------------------
     # 3.  ABBREVIATION HANDLING
     # ------------------------------------------------------------------
+    
+    # Standard words that are always safe to expand
     safe_abbreviations = {
-        "Mr.": "Mister", "Mrs.": "Missus", "Ms.": "Miss", "Dr.": "Doctor",
+        "Mr.": "Mister", "Mrs.": "Missus", "Ms.": "Miss", "Dr.": "Doctor", # Removed duplicate "Dr.: Drive"
         "Prof.": "Professor", "Rev.": "Reverend", "Hon.": "Honorable",
         "Jr.": "Junior", "Sr.": "Senior", "Gen.": "General", "Adm.": "Admiral",
         "Capt.": "Captain", "Cmdr.": "Commander", "Lt.": "Lieutenant",
@@ -372,18 +353,10 @@ def extract_text_and_title_from_epub(epub_path):
         "vs.": "versus", "et al.": "et alia", "etc.": "et cetera",
         "e.g.": "for example", "i.e.": "that is", "Ph.D.": "Doctor of Philosophy",
         "M.A.": "Master of Arts", "B.A.": "Bachelor of Arts", "pp.": "pages",
-        "vol.": "volume", "No.": "Number", "Fig.": "Figure", "Eq.": "Equation",
-        "U.S.": "United States", "U.S.A.": "United States of America",
+        "vol.": "volume", "U.S.": "United States", "U.S.A.": "United States of America",
         "U.K.": "United Kingdom", "E.U.": "European Union", "Ave.": "Avenue",
-        "Blvd.": "Boulevard", "Rd.": "Road", "Dr.": "Drive", "mm": "millimeters",
-        "cm": "centimeters", 
-        # "m": "meters", <-- REMOVED THIS (Caused "I'm" -> "I meters")
-        "km": "kilometers", "mg": "milligrams",
-        "g": "grams", "kg": "kilograms", "in.": "inches", "ft.": "feet",
-        "yd.": "yards", "mi.": "miles", "oz.": "ounces", "lb.": "pounds",
-        "lbs.": "pounds", "mph": "miles per hour", "kph": "kilometers per hour",
-        "sq.": "square", "cu.": "cubic", "deg.": "degrees", "sec.": "second",
-        "min.": "minute", "hr.": "hour", "A.M.": "ay em", "P.M.": "pee em",
+        "Blvd.": "Boulevard", "Rd.": "Road", "sq.": "square", "cu.": "cubic", 
+        "deg.": "degrees", "A.M.": "ay em", "P.M.": "pee em",
         "Jan.": "January", "Feb.": "February", "Mar.": "March", "Apr.": "April",
         "Jun.": "June", "Jul.": "July", "Aug.": "August", "Sep.": "September",
         "Oct.": "October", "Nov.": "November", "Dec.": "December",
@@ -391,11 +364,35 @@ def extract_text_and_title_from_epub(epub_path):
         "est.": "established"
     }
 
-    # --- FIX: HANDLE METERS CONTEXTUALLY ---
-    # Only convert 'm' to 'meters' if preceded by a digit (e.g., 100m)
-    # This ignores "I'm", "them", etc.
-    text = re.sub(r'(?<=\d)\s*m\b', ' meters', text)
+    # --- FIX 2: CONTEXT-AWARE UNITS ---
+    # Units ONLY expand if they are immediately preceded by a digit (e.g., "10 in.")
+    # This prevents "Come in." from turning into "Come inches."
+    unit_abbreviations = {
+        "mm": "millimeters", "cm": "centimeters", "m": "meters", "km": "kilometers",
+        "mg": "milligrams", "g": "grams", "kg": "kilograms",
+        "in": "inches", "in.": "inches", "ft": "feet", "ft.": "feet",
+        "yd": "yards", "yd.": "yards", "mi": "miles", "mi.": "miles",
+        "oz": "ounces", "oz.": "ounces", "lb": "pounds", "lb.": "pounds",
+        "lbs": "pounds", "lbs.": "pounds", "mph": "miles per hour", 
+        "kph": "kilometers per hour", "sec": "seconds", "sec.": "seconds", 
+        "min": "minutes", "min.": "minutes", "hr": "hours", "hr.": "hours"
+    }
+    
+    for abbr, full in unit_abbreviations.items():
+        # (?<=\d) ensures a digit precedes (with optional spaces)
+        # (?!\w) ensures we don't partially match words (e.g., 'm' in 'many')
+        text = re.sub(rf'(?<=\d)\s*{re.escape(abbr)}(?!\w)', f' {full}', text, flags=re.IGNORECASE)
 
+    # --- FIX 3: CONTEXT-AWARE PREFIXES ---
+    # Prefixes ONLY expand if followed by a number
+    # Prevents "I said no." -> "I said Number."
+    prefix_abbreviations = {
+        "No.": "Number", "Fig.": "Figure", "Eq.": "Equation"
+    }
+    for abbr, full in prefix_abbreviations.items():
+        text = re.sub(rf'\b{re.escape(abbr)}\s*(?=\d)', f'{full} ', text, flags=re.IGNORECASE)
+
+    # Apply safe abbreviations blindly now that problematic ones are removed
     for abbr, full in safe_abbreviations.items():
         text = re.sub(r'\b' + re.escape(abbr) + r'(?!\w)', full, text, flags=re.IGNORECASE)
 
@@ -436,6 +433,8 @@ def extract_text_and_title_from_epub(epub_path):
 
     print(f"Text cleaned and normalized. Original length: {len(raw_text)}, Final length: {len(cleaned_text)}")
 
+    book = None
+
     return cleaned_text, title, authors
 
 
@@ -452,8 +451,7 @@ def convert_to_epub(input_path, output_path):
 
 def detect_file_type(file_path):
     try:
-        mime = magic.Magic(mime=True)
-        return mime.from_file(file_path)
+        return magic.from_file(file_path, mime=True)
     except Exception as e:
         raise RuntimeError(f"Error detecting file type: {e}")
 
@@ -471,26 +469,22 @@ def sanitize_filename(filename):
 def show_converted_audiobooks():
     output_dir = os.path.join("Working_files", "Book")
     if not os.path.exists(output_dir):
-        return ["No audiobooks found."]
-    files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.endswith(('.mp3', '.m4b'))]
-    if not files:
-        return ["No audiobooks found."]
-    return files
+        return []
+    files =[os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.endswith(('.mp3', '.m4b'))]
+    return files if files else[]
 
 @gpu_decorator
-def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, show_info=silent_info, progress=gr.Progress(),
+def infer(processed_ref_audio, processed_ref_text, gen_text, cross_fade_duration=0.0, speed=1, show_info=silent_info, progress=gr.Progress(),
           progress_start_fraction=0.0, progress_end_fraction=1.0, ebook_idx=0, num_ebooks=1):
-    try:
-        ref_audio, ref_text = preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=show_info)
-    except Exception as e:
-        raise RuntimeError(f"Error in preprocessing reference audio and text: {e}")
+    
+    # Preprocessing has been moved outside this function to save massive overhead per chunk.
     if not gen_text.strip():
         raise ValueError("Generated text is empty. Please provide valid text content.")
 
     try:
         with torch.no_grad():
             final_wave, final_sample_rate, _ = infer_process(
-                ref_audio, ref_text, gen_text, F5TTS_ema_model, vocoder,
+                processed_ref_audio, processed_ref_text, gen_text, F5TTS_ema_model, vocoder,
                 cross_fade_duration=cross_fade_duration, speed=speed,
                 show_info=show_info, progress=progress,
                 progress_start_fraction=progress_start_fraction,
@@ -501,14 +495,24 @@ def infer(ref_audio_orig, ref_text, gen_text, cross_fade_duration=0.0, speed=1, 
         raise RuntimeError(f"Error during inference process: {e}")
     
     print(f"Generated audio length: {len(final_wave)} samples at {final_sample_rate} Hz.")
-    return (final_sample_rate, final_wave), ref_text
+    return (final_sample_rate, final_wave), processed_ref_text
 
-@gpu_decorator
+
 def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_duration, speed, progress=gr.Progress()):
     try:
-        processed_audiobooks = []
+        processed_audiobooks =[]
         num_ebooks = len(gen_file_input)
         ebook_frac = {"init_detect_convert": 0.001, "extract_text": 0.001, "infer": 0.997, "mp3_meta": 0.001}
+
+        # --- MASSIVE OPTIMIZATION & MEMORY FIX ---
+        # Preprocess the reference audio ONCE for the entire batch.
+        # This prevents the app from reloading the file and transcribing it thousands of times per book.
+        progress(0, desc="Preprocessing reference audio...")
+        ref_text = ref_text_input or ""
+        try:
+            processed_ref_audio, processed_ref_text = preprocess_ref_audio_text(ref_audio_input, ref_text, show_info=silent_info)
+        except Exception as e:
+            raise gr.Error(f"Error preprocessing reference audio: {e}")
 
         for idx, ebook_file_data in enumerate(gen_file_input):
             current_ebook_base_progress = idx / float(num_ebooks)
@@ -552,7 +556,7 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
                 progress((idx + 1) / float(num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Skipped (Text Extraction Error)")
                 if temp_epub_created and os.path.exists(epub_path_for_extraction): os.remove(epub_path_for_extraction)
                 continue
-            ref_text = ref_text_input or ""
+            
             progress_offset_within_ebook += ebook_frac["extract_text"]
             progress(current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks), desc=f"Ebook {idx+1}/{num_ebooks}: Text extracted.")
 
@@ -560,34 +564,23 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
             overall_infer_start_frac = current_ebook_base_progress + (progress_offset_within_ebook / num_ebooks)
             temp_chunks_dir = os.path.join("Working_files", "temp_audio_chunks", sanitize_filename(ebook_title))
             ensure_directory(temp_chunks_dir)
-            chunk_file_paths = []
+            chunk_file_paths =[]
 
-            # --- CORRECTED AND IMPROVED TEXT CHUNKING LOGIC ---
             print("Tokenizing text and building optimized chunks for TTS stability...")
 
-            # Step 1: Get all sentences from the book text.
             initial_sentences = sent_tokenize(gen_text)
-            
-            # Step 2: Define a maximum safe length for a single phrase/clause before it's split.
-            # This helps break down extremely long, run-on sentences. 250 is a good default.
             MAX_PHRASE_LENGTH = 200
-            
-            # Step 3: Define the absolute maximum character length for a chunk sent to the TTS model.
-            # This is the most important value to control. Start with a value around 2500.
-            # If you still get hallucinations, lower this value.
             MAX_CHUNK_LENGTH_CHARS = 200
 
-            # --- Split long sentences into smaller, more manageable phrases ---
-            intermediate_phrases = []
+            intermediate_phrases =[]
             for sentence in initial_sentences:
                 if len(sentence) <= MAX_PHRASE_LENGTH:
                     intermediate_phrases.append(sentence)
                 else:
-                    # Logic to split sentences that are too long at natural breaks
                     current_part = sentence
                     while len(current_part) > MAX_PHRASE_LENGTH:
                         split_pos = -1
-                        delimiters = [',', ';', '—', '–']
+                        delimiters =[',', ';', '—', '–']
                         for delimiter in delimiters:
                             pos = current_part.rfind(delimiter, 0, MAX_PHRASE_LENGTH)
                             if pos > split_pos:
@@ -605,31 +598,23 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
                     if current_part:
                         intermediate_phrases.append(current_part)
 
-            # --- Group the phrases into final chunks based on MAX_CHUNK_LENGTH_CHARS ---
-            text_super_chunks = []
+            text_super_chunks =[]
             current_chunk = ""
             for phrase in intermediate_phrases:
-                # Check if adding the next phrase would exceed the max chunk length
                 if len(current_chunk) + len(phrase) + 1 > MAX_CHUNK_LENGTH_CHARS:
-                    # If the current chunk is not empty, finalize it
                     if current_chunk:
                         text_super_chunks.append(current_chunk)
-                    # Start a new chunk with the current phrase
                     current_chunk = phrase
                 else:
-                    # Add the phrase to the current chunk
                     if current_chunk:
                         current_chunk += " " + phrase
                     else:
                         current_chunk = phrase
             
-            # Add the last remaining chunk to the list
             if current_chunk:
                 text_super_chunks.append(current_chunk)
 
             num_super_chunks = len(text_super_chunks)
-
-            # --- END OF CORRECTED CHUNKING LOGIC ---
 
             if num_super_chunks == 0:
                 print(f"Error: No text chunks could be created from {ebook_title}. Skipping.")
@@ -655,11 +640,13 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
 
                     progress_updater(chunk_progress_start)
                     
-                    # CORRECTED: Added try...finally for robust memory cleanup
-                    wave_chunk = None # Initialize to None
+                    audio_out_chunk = None
+                    sample_rate_chunk = None
+                    wave_chunk = None
                     try:
+                        # Pass the pre-processed ref_audio to infer
                         audio_out_chunk, _ = infer(
-                            ref_audio_input, ref_text, text_chunk,
+                            processed_ref_audio, processed_ref_text, text_chunk,
                             cross_fade_duration, speed, show_info=silent_info,
                             progress=progress_updater,
                             ebook_idx=idx, num_ebooks=num_ebooks,
@@ -667,18 +654,26 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
                             progress_end_fraction=chunk_progress_end
                         )
                         sample_rate_chunk, wave_chunk = audio_out_chunk
+                        
+                        # First save to disk
+                        if wave_chunk is not None and wave_chunk.any():
+                            chunk_path = os.path.join(temp_chunks_dir, f"chunk_{i:04d}.wav")
+                            if hasattr(wave_chunk, 'numpy'):
+                                wave_chunk = wave_chunk.numpy()
+                            sf.write(chunk_path, wave_chunk, sample_rate_chunk)
+                            chunk_file_paths.append(chunk_path)
+                        else:
+                            print(f"Warning: Empty audio returned for super-chunk {i+1}. Skipping this part.")
+                    except Exception as e:
+                        print(f"Error during TTS inference loop for chunk {i}: {e}")
                     finally:
-                        # This cleanup now runs even if `infer` throws an error
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        # CRITICAL MEMORY CLEANUP: Drop local references BEFORE calling empty_cache
+                        # Setting to None pushes the active tensor objects to 0 references
+                        audio_out_chunk = None
+                        sample_rate_chunk = None
+                        wave_chunk = None
+                        
 
-                    if wave_chunk is not None and wave_chunk.any():
-                        chunk_path = os.path.join(temp_chunks_dir, f"chunk_{i:04d}.wav")
-                        sf.write(chunk_path, wave_chunk, sample_rate_chunk)
-                        chunk_file_paths.append(chunk_path)
-                    else:
-                        print(f"Warning: Empty audio returned for super-chunk {i+1}. Skipping this part.")
             except Exception as e:
                 print(f"Error during TTS inference loop for {ebook_title}: {e}")
                 continue
@@ -697,59 +692,62 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
             final_mp3_dir = os.path.join("Working_files", "Book")
             final_mp3_path = os.path.join(final_mp3_dir, f"{sanitized_title}.mp3")
 
-            # CORRECTED: Entire FFmpeg block replaced for robustness
             try:
                 concat_list_path = os.path.join(temp_chunks_dir, "concat_list.txt")
-                with open(concat_list_path, 'w') as f:
+                with open(concat_list_path, 'w', encoding='utf-8') as f:
                     for path in chunk_file_paths:
-                        # Use relative paths for robustness
                         chunk_filename = os.path.basename(path)
                         f.write(f"file '{chunk_filename}'\n")
 
-                # Ensure the final output directory exists before running FFmpeg
                 ensure_directory(final_mp3_dir)
 
-                # Command uses relative paths, so it must be run from the chunks directory
-                ffmpeg_command = [
-                    'ffmpeg', '-f', 'concat', '-safe', '0', '-i', 'concat_list.txt',
-                    '-b:a', '192k', '-y', os.path.abspath(final_mp3_path) # Use absolute path for the output file
+                # --- NEW OPTIMIZED FFMPEG COMMAND ---
+                # Build a single command to handle audio concat, cover art, and metadata
+                ffmpeg_command =[
+                    'ffmpeg', '-f', 'concat', '-safe', '0', '-i', 'concat_list.txt'
                 ]
 
-                print(f"Starting FFmpeg concatenation for {len(chunk_file_paths)} chunks...")
-                print(f"Executing command: {' '.join(ffmpeg_command)} in directory {temp_chunks_dir}")
+                # 1. Embed Cover Art natively during the FFmpeg pass
+                if cover_image and os.path.exists(cover_image):
+                    ffmpeg_command.extend(['-i', os.path.abspath(cover_image)])
+                    ffmpeg_command.extend(['-map', '0:a', '-map', '1:v'])
+                    ffmpeg_command.extend(['-c:v', 'mjpeg', '-disposition:v', 'attached_pic'])
 
-                # Use Popen for better process control and logging on long tasks
+                # 2. Encode to MP3 and inject ID3 Metadata
+                ffmpeg_command.extend([
+                    '-c:a', 'libmp3lame', '-b:a', '192k',
+                    '-id3v2_version', '3',
+                    '-metadata', f'title={ebook_title}',
+                    '-metadata', f'artist={ebook_author}',
+                    '-metadata', f'album={ebook_title}',
+                    '-y', os.path.abspath(final_mp3_path)
+                ])
+
+                print(f"Starting FFmpeg processing for {len(chunk_file_paths)} chunks...")
+                print("--> Look at the terminal for live encoding speed and time progress! <--")
+                
+                # Removed stdout/stderr PIPEs so FFmpeg prints its progress bar natively to your console
                 process = subprocess.Popen(
                     ffmpeg_command,
-                    cwd=temp_chunks_dir,  # CRITICAL: Execute FFmpeg in the chunks directory
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding='utf-8'
+                    cwd=temp_chunks_dir
                 )
 
-                # Stream stdout and stderr to print progress and errors in real-time
-                stdout, stderr = process.communicate()
+                # Wait for FFmpeg to finish
+                process.wait()
 
                 if process.returncode != 0:
                     print("--- FFmpeg Error ---")
-                    print("Return Code:", process.returncode)
-                    print("\n--- FFmpeg STDOUT ---")
-                    print(stdout)
-                    print("\n--- FFmpeg STDERR ---")
-                    print(stderr)
-                    raise gr.Error(f"FFmpeg failed for {ebook_title}. Check console for detailed logs.")
+                    raise gr.Error(f"FFmpeg failed for {ebook_title}. Check the terminal console for details.")
                 else:
-                    print("FFmpeg concatenation successful.")
-                    embed_metadata_into_mp3(final_mp3_path, cover_image, ebook_title, ebook_author, album_title=ebook_title)
+                    print("FFmpeg concatenation and metadata embedding successful.")
+                    # REMOVED the Mutagen embed_metadata_into_mp3() call! FFmpeg already handled it natively.
 
             except Exception as e:
                 print(f"An error occurred during the FFmpeg/metadata stage for {ebook_title}: {e}")
-                continue # Skip to the next book
+                continue
             finally:
                 import shutil
                 if os.path.exists(temp_chunks_dir):
-                    print(f"Cleaning up temporary directory: {temp_chunks_dir}")
                     shutil.rmtree(temp_chunks_dir)
 
 
@@ -764,11 +762,28 @@ def basic_tts(ref_audio_input, ref_text_input, gen_file_input, cross_fade_durati
                 try: os.remove(epub_path_for_extraction)
                 except OSError as e: print(f"Error removing temp EPUB {epub_path_for_extraction}: {e}")
 
+            # DEREFERENCE massive text arrays so memory can be recovered before the next book
+            gen_text = None
+            initial_sentences = None
+            intermediate_phrases = None
+            text_super_chunks = None
+            
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             processed_audiobooks.append(final_mp3_path)
             final_ebook_progress = (idx + 1) / float(num_ebooks)
             progress(final_ebook_progress, desc=f"Ebook {idx+1}/{num_ebooks}: Completed.")
-            yield final_mp3_path, processed_audiobooks
+            
+            # --- FIX: Prevent Gradio RAM leak from redundant file copying ---
+            if idx == num_ebooks - 1:
+                yield processed_audiobooks
+            else:
+                yield gr.skip() if hasattr(gr, 'skip') else gr.update()
 
+        # --- THE FOR-LOOP ENDS HERE ---
+        
         if num_ebooks > 0 and not processed_audiobooks and locals().get('idx') == num_ebooks - 1:
             progress(1.0, desc="All eBooks skipped or failed processing.")
         elif processed_audiobooks:
@@ -784,7 +799,6 @@ DEFAULT_REF_AUDIO_PATH = "/app/default_voice.mp3"
 DEFAULT_REF_TEXT = "The birch canoe slid on the smooth planks. Glue the sheet to the dark blue background. It's easy to tell the depth of a well. The juice of lemons makes fine punch."
 
 def create_gradio_app():
-    """Create and configure the Gradio application."""
     with gr.Blocks(theme=gr.themes.Ocean()) as app:
         gr.Markdown("# eBook to Audiobook with F5-TTS!")
         ref_audio_input = gr.Audio(
@@ -799,7 +813,6 @@ def create_gradio_app():
         generate_btn = gr.Button("Start", variant="primary")
         show_audiobooks_btn = gr.Button("Show All Completed Audiobooks", variant="secondary")
         audiobooks_output = gr.Files(label="Converted Audiobooks (Download Links)")
-        player = gr.Audio(label="Play Latest Converted Audiobook", interactive=False)
         with gr.Accordion("Advanced Settings", open=False):
             ref_text_input = gr.Textbox(
                 label="Reference Text (Leave Blank for Automatic Transcription)",
@@ -816,7 +829,7 @@ def create_gradio_app():
         generate_btn.click(
             basic_tts,
             inputs=[ref_audio_input, ref_text_input, gen_file_input, cross_fade_duration_slider, speed_slider],
-            outputs=[player, audiobooks_output],
+            outputs=[audiobooks_output],
         )
         show_audiobooks_btn.click(
             show_converted_audiobooks, inputs=[], outputs=[audiobooks_output],
@@ -845,4 +858,3 @@ if __name__ == "__main__":
     else:
         app = create_gradio_app()
         app.queue().launch(debug=True)
-
