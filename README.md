@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> **New Version Available!** Please use my new version using **OmniVoice** instead of f5tts; it is much better and more advanced.  
+> **Check it out here: [Ebook-to-Audiobook-with-OmniVoice](https://github.com/quantumlump/Ebook-to-Audiobook-with-OmniVoice)**
+
 # Easy eBook to Audiobook Converter with F5-TTS
 
 ![Screenshot 2025-12-30 at 5 56 10 PM](https://github.com/user-attachments/assets/85da5017-3e2a-4556-a4b9-01b00bf8162e)
